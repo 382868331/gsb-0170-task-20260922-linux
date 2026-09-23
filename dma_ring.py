@@ -24,6 +24,17 @@ validates a whole chain up front; ``CopyEngine`` validates incrementally
 while copying.  A bad descriptor completes its chain with an error and the
 engine halts without consuming subsequent queued chains.
 
+Requests: on top of the same ring, :class:`RequestEngine` groups several
+independently-submitted descriptors into one request.  Descriptors may be
+acquired and completed in any order, but the request result is published
+only once every descriptor has completed.  Each completion carries the
+generation the descriptor was acquired with: a stale (old-generation,
+e.g. late after ring wrap and slot reuse) or duplicate completion is
+rejected.  A descriptor completed with ``error`` aborts the request: the
+still-pending descriptors are released as ``skipped`` and every occupied
+slot goes back to the CPU in the same publication step, so an errored
+request never leaks slots.
+
 Only the contract documented here is implemented; this is not a complete
 model of any industry-standard DMA controller.
 """
@@ -75,6 +86,24 @@ class ChainError(DmaRingError):
         self.reason = reason
 
 
+class RequestError(DmaRingError):
+    """A request-level rule was violated (unknown/stale/duplicate completion,
+    descriptor not part of the request, or an invalid request submission).
+
+    Attributes:
+        request_id: the request the offending call targeted (or ``None``).
+        index:      ring index of the offending descriptor (or ``None``).
+        reason:     short machine-stable reason string.
+    """
+
+    def __init__(self, message: str, *, request_id: int | None = None,
+                 index: int | None = None, reason: str | None = None) -> None:
+        super().__init__(message)
+        self.request_id = request_id
+        self.reason = reason
+        self.index = index
+
+
 # ---------------------------------------------------------------------------
 # Public data structures
 # ---------------------------------------------------------------------------
@@ -123,6 +152,35 @@ class ChainResult:
     error_index: int | None
     bytes_copied: int
     descriptors: tuple[int, ...]
+
+
+@dataclass(frozen=True)
+class DescriptorCompletion:
+    """One descriptor's outcome inside a completed :class:`RequestResult`,
+    in the request's descriptor submission order (not completion order)."""
+
+    index: int
+    status: str            # "ok", "error" or "skipped"
+    error: str | None
+    bytes_done: int
+
+
+@dataclass(frozen=True)
+class RequestResult:
+    """Outcome of one multi-descriptor request.
+
+    Published only after every descriptor of the request has settled.
+    ``descriptors`` follows the request's submission order; descriptors that
+    were still pending when another one errored are present with status
+    ``skipped`` (their slots are released back to the CPU).
+    """
+
+    request_id: int
+    status: str            # "ok" or "error"
+    error: str | None
+    error_index: int | None
+    bytes_copied: int
+    descriptors: tuple[DescriptorCompletion, ...]
 
 
 # ---------------------------------------------------------------------------
@@ -550,3 +608,333 @@ class CopyEngine:
             head=head, status="error", error=problem, error_index=idx,
             bytes_copied=copied, descriptors=tuple(done)))
         self.halted = True
+
+
+# ---------------------------------------------------------------------------
+# Request engine: multiple independently-completable descriptors per request
+# ---------------------------------------------------------------------------
+
+# Per-descriptor lifecycle states inside a pending request.
+_REQ_PENDING = "pending"   # acquired by the engine, not yet completed
+_REQ_DONE = "done"         # completed ok/error by the device
+_REQ_SKIPPED = "skipped"   # released unprocessed when another descriptor errored
+
+
+class RequestEngine:
+    """Groups several descriptors into one request with out-of-order
+    completion and generation-checked completion identity.
+
+    Workflow:
+
+    1. The CPU ``cpu_write``/``cpu_release``s each descriptor (the existing
+       ring protocol); their order on the ring is irrelevant.
+    2. :meth:`submit_request` validates the whole descriptor list, then
+       acquires every slot atomically (either all are acquired or none are),
+       recording each slot's generation.
+    3. The device completes descriptors in *any* order via
+       :meth:`complete_descriptor`, passing the generation the descriptor
+       was acquired with.  Completions with a non-matching generation are
+       rejected as stale (old completion after ring wrap); a second
+       completion with the same generation is rejected as a duplicate.
+    4. Once **all** descriptors have completed ``ok``, one
+       :class:`RequestResult` (status ``ok``) is published.  The first
+       descriptor completed with ``error`` aborts the request: every still
+       pending descriptor is released back to the CPU with status
+       ``skipped`` in the same step, and one error :class:`RequestResult` is
+       published.  Either way an ended request leaves no slot occupied.
+
+    Published results accumulate in :attr:`results` in completion order of
+    the requests; :attr:`output` holds the bytes of ``ok`` descriptors in
+    the (possibly out-of-order) order they completed.
+    """
+
+    def __init__(self, ring: DmaRing) -> None:
+        if not isinstance(ring, DmaRing):
+            raise TypeError(
+                f"ring: expected DmaRing, got {type(ring).__name__}")
+        self.ring = ring
+        self._requests: dict[int, dict] = {}
+        self._by_index: dict[int, int] = {}
+        self._next_id = 0
+        self.results: list[RequestResult] = []
+        self._output = bytearray()
+
+    @property
+    def output(self) -> bytes:
+        """Bytes of ``ok`` descriptors, in their actual completion order."""
+        return bytes(self._output)
+
+    @property
+    def pending(self) -> int:
+        """Number of submitted requests not yet fully settled."""
+        return len(self._requests)
+
+    # -- submission ---------------------------------------------------------
+
+    def submit_request(self, descriptors, *, request_id=None
+                       ) -> tuple[DescriptorSnapshot, ...]:
+        """Validate and acquire all descriptors of a new request.
+
+        ``descriptors`` is an iterable of distinct ring indices, each
+        currently owned by the device (``cpu_release``d and not already
+        acquired).  Every descriptor's committed buffer range must lie
+        inside the pool.  All validation happens before any slot is
+        acquired, so a rejected submission leaves ring and engine state
+        untouched.
+
+        ``request_id`` is assigned automatically when omitted; explicit ids
+        must be non-negative ints not currently in use.  Returns the
+        acquired :class:`DescriptorSnapshot` values in submission order.
+        """
+        ring = self.ring
+        rid = self._provisional_id(request_id)
+
+        indices: list[int] = []
+        seen: set[int] = set()
+        for raw in descriptors:
+            _, idx = ring._slot(raw)  # validates type/range
+            if idx in seen:
+                raise RequestError(
+                    f"request {rid}: descriptor {idx} listed more than once",
+                    request_id=rid, index=idx, reason="duplicate-descriptor")
+            seen.add(idx)
+            indices.append(idx)
+        if not indices:
+            raise RequestError(
+                f"request {rid}: at least one descriptor is required",
+                request_id=rid, reason="empty-request")
+
+        # Validate ownership and buffer ranges for *every* descriptor before
+        # acquiring anything: failures occupy no slots.
+        pool = len(ring.pool)
+        for idx in indices:
+            slot = ring._slots[idx]
+            if idx in self._by_index:
+                raise RequestError(
+                    f"request {rid}: descriptor {idx} already belongs to "
+                    f"request {self._by_index[idx]}",
+                    request_id=rid, index=idx, reason="descriptor-busy")
+            if slot.owner is not Owner.DEVICE or slot.device_held:
+                raise RequestError(
+                    f"request {rid}: descriptor {idx} is not available for "
+                    f"acquisition (owner={slot.owner.value}, "
+                    f"device_held={slot.device_held})",
+                    request_id=rid, index=idx, reason="descriptor-unavailable")
+            end = slot.offset + slot.length
+            if end > pool:
+                raise RequestError(
+                    f"request {rid}: descriptor {idx} buffer range "
+                    f"[{slot.offset}, {end}) exceeds pool size {pool}",
+                    request_id=rid, index=idx,
+                    reason="buffer-out-of-range")
+
+        # All checks passed: acquire atomically.
+        snaps: list[DescriptorSnapshot] = []
+        acquired: list[int] = []
+        try:
+            for idx in indices:
+                snaps.append(ring.device_acquire(idx))
+                acquired.append(idx)
+        except DmaRingError:
+            # Defensive only: pre-checks guarantee this cannot trigger.
+            for done in acquired:
+                ring.device_release(done, status="skipped")
+            raise
+
+        # Commit the id choice only after every check and acquisition
+        # succeeded, so a rejected submission does not consume an id.
+        self._next_id = max(self._next_id, rid + 1)
+
+        entries = {}
+        completion_order: list[int] = []
+        for idx, snap in zip(indices, snaps):
+            entries[idx] = {
+                "snap": snap,
+                "state": _REQ_PENDING,
+                "status": None,
+                "error": None,
+                "bytes_done": 0,
+            }
+        req = {
+            "id": rid,
+            "order": tuple(indices),
+            "entries": entries,
+            "completion_order": completion_order,
+            "status": None,
+        }
+        self._requests[rid] = req
+        for idx in indices:
+            self._by_index[idx] = rid
+        return tuple(snaps)
+
+    # -- completion ---------------------------------------------------------
+
+    def complete_descriptor(self, request_id, index, *, generation,
+                            status="ok", bytes_done=0, error=None
+                            ) -> RequestResult | None:
+        """Report one descriptor's completion.  Descriptors of a request may
+        be completed in any order.
+
+        ``generation`` must be the generation returned at acquisition.  A
+        mismatch raises :class:`RequestError` (``stale-generation``); a
+        repeated completion of the same descriptor raises
+        :class:`RequestError` (``duplicate-completion``) and never touches
+        the ring.
+
+        The request result is published only when this call settles the last
+        outstanding descriptor.  In that case the new
+        :class:`RequestResult` is returned (otherwise ``None``).  A
+        descriptor completed with status ``error`` aborts the request and
+        releases every still-pending descriptor as ``skipped``.
+        """
+        ring = self.ring
+        rid = _as_int(request_id, "request_id")
+        _, idx = ring._slot(index)
+        gen = _as_int(generation, "generation")
+
+        req = self._requests.get(rid)
+        if req is None:
+            raise RequestError(
+                f"request {rid}: unknown or already finished request",
+                request_id=rid, index=idx, reason="unknown-request")
+        entry = req["entries"].get(idx)
+        if entry is None:
+            raise RequestError(
+                f"request {rid}: descriptor {idx} is not part of this "
+                f"request",
+                request_id=rid, index=idx, reason="not-in-request")
+        if gen != entry["snap"].generation:
+            raise RequestError(
+                f"request {rid}: descriptor {idx} completion generation "
+                f"{gen} does not match acquired generation "
+                f"{entry['snap'].generation} (stale handle after ring "
+                f"wrap)",
+                request_id=rid, index=idx, reason="stale-generation")
+        if entry["state"] != _REQ_PENDING:
+            raise RequestError(
+                f"request {rid}: descriptor {idx} already completed "
+                f"({entry['state']})",
+                request_id=rid, index=idx, reason="duplicate-completion")
+        if status not in ("ok", "error"):
+            raise ValueError(
+                f"request {rid}: descriptor {idx}: completion status must "
+                f"be 'ok' or 'error', got {status!r}")
+
+        # ring.device_release performs all validation before mutating, so a
+        # rejected call leaves both the slot and the request untouched.
+        ring.device_release(idx, status=status, bytes_done=bytes_done,
+                            error=error)
+
+        entry["state"] = _REQ_DONE
+        entry["status"] = status
+        entry["error"] = error
+        entry["bytes_done"] = bytes_done
+        req["completion_order"].append(idx)
+        if status == "ok":
+            snap = entry["snap"]
+            self._output += bytes(
+                ring.pool[snap.offset: snap.offset + bytes_done])
+
+        entries = req["entries"]
+        if status == "error":
+            return self._abort_request(req, failed_index=idx)
+        if all(e["state"] != _REQ_PENDING for e in entries.values()):
+            return self._publish_request(req, status="ok", error=None,
+                                         error_index=None)
+        return None
+
+    def _abort_request(self, req: dict, *, failed_index: int) -> RequestResult:
+        """Release every still-pending descriptor as ``skipped`` and publish
+        the error result.  The failing descriptor was already released by
+        the completing call; this routine releases all the rest, so the
+        request ends holding no slots."""
+        ring = self.ring
+        problem = req["entries"][failed_index]["error"]
+        for idx in req["order"]:
+            entry = req["entries"][idx]
+            if entry["state"] == _REQ_PENDING:
+                ring.device_release(idx, status="skipped")
+                entry["state"] = _REQ_SKIPPED
+                entry["status"] = "skipped"
+        return self._publish_request(req, status="error", error=problem,
+                                     error_index=failed_index)
+
+    def _publish_request(self, req: dict, *, status: str,
+                         error: str | None, error_index: int | None
+                         ) -> RequestResult:
+        total = 0
+        descs = []
+        for idx in req["order"]:
+            entry = req["entries"][idx]
+            descs.append(DescriptorCompletion(
+                index=idx, status=entry["status"], error=entry["error"],
+                bytes_done=entry["bytes_done"]))
+            if entry["status"] == "ok":
+                total += entry["bytes_done"]
+        result = RequestResult(
+            request_id=req["id"], status=status, error=error,
+            error_index=error_index, bytes_copied=total,
+            descriptors=tuple(descs))
+        self.results.append(result)
+        for idx in req["order"]:
+            del self._by_index[idx]
+        del self._requests[req["id"]]
+        return result
+
+    # -- introspection ------------------------------------------------------
+
+    def request_snapshot(self, request_id) -> dict:
+        """Out-of-band view of a pending request (tests/demos only, not part
+        of the protocol).  Raises :class:`RequestError` once finished."""
+        rid = _as_int(request_id, "request_id")
+        req = self._requests.get(rid)
+        if req is None:
+            raise RequestError(
+                f"request {rid}: unknown or already finished request",
+                request_id=rid, reason="unknown-request")
+        return {
+            "request_id": rid,
+            "order": req["order"],
+            "states": {idx: req["entries"][idx]["state"]
+                       for idx in req["order"]},
+            "completion_order": tuple(req["completion_order"]),
+            "remaining": tuple(
+                idx for idx in req["order"]
+                if req["entries"][idx]["state"] == _REQ_PENDING),
+        }
+
+    def acquired_snapshot(self, request_id, index) -> DescriptorSnapshot:
+        """Return the snapshot recorded at submission (with its generation)."""
+        rid = _as_int(request_id, "request_id")
+        req = self._requests.get(rid)
+        if req is None:
+            raise RequestError(
+                f"request {rid}: unknown or already finished request",
+                request_id=rid, reason="unknown-request")
+        entry = req["entries"].get(index)
+        if entry is None:
+            raise RequestError(
+                f"request {rid}: descriptor {index} is not part of this "
+                f"request", request_id=rid, index=index,
+                reason="not-in-request")
+        return entry["snap"]
+
+    # -- internals ----------------------------------------------------------
+
+    def _provisional_id(self, request_id) -> int:
+        """Resolve a request id without consuming it.
+
+        Automatic ids are committed (by advancing ``_next_id``) only once a
+        submission fully succeeds, so rejected submissions do not burn an id
+        and leave no half-updated bookkeeping.
+        """
+        if request_id is None:
+            return self._next_id
+        rid = _as_int(request_id, "request_id")
+        if rid < 0:
+            raise ValueError(f"request_id: must be >= 0, got {rid}")
+        if rid in self._requests:
+            raise RequestError(
+                f"request {rid}: id already in use",
+                request_id=rid, reason="duplicate-request-id")
+        return rid

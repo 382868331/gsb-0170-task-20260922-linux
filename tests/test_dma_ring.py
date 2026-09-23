@@ -11,6 +11,8 @@ from dma_ring import (
     DmaRing,
     GenerationError,
     OwnershipError,
+    RequestEngine,
+    RequestError,
     VisibilityError,
 )
 
@@ -332,6 +334,399 @@ class TestChainsAndCopying(unittest.TestCase):
         self.assertTrue(ring.inspect(0)["device_held"])
         ring.device_release(0, status="ok", bytes_done=4)
         self.assertEqual(ring.cpu_acquire(0).status, "ok")
+
+
+# ---------------------------------------------------------------------------
+# Multi-descriptor requests: out-of-order completion, generation checks,
+# error-release semantics.  Expected byte strings are hand-computed slices
+# of SOURCE, never produced by the implementation under test.
+# ---------------------------------------------------------------------------
+
+def release_descriptors(ring, specs):
+    """specs: list of (index, offset, length)."""
+    for index, offset, length in specs:
+        write_and_release(ring, index, offset=offset, length=length,
+                          next=None)
+
+
+def recycle(ring, indices):
+    """CPU acquires finished slots so they can be written again."""
+    for idx in indices:
+        ring.cpu_acquire(idx)
+
+
+class TestRequestNormal(unittest.TestCase):
+    def test_out_of_order_completion_publishes_only_at_end(self):
+        ring = make_ring()
+        release_descriptors(ring, [(2, 0, 4), (5, 8, 4), (7, 16, 4)])
+        engine = RequestEngine(ring)
+        snaps = engine.submit_request([2, 5, 7])
+        self.assertEqual([s.index for s in snaps], [2, 5, 7])
+        self.assertEqual(engine.pending, 1)
+        self.assertEqual(engine.results, [])
+
+        # Complete in scrambled order; no result until the last one.
+        self.assertIsNone(
+            engine.complete_descriptor(0, 5, generation=1, bytes_done=4))
+        self.assertIsNone(
+            engine.complete_descriptor(0, 7, generation=1, bytes_done=4))
+        self.assertEqual(engine.results, [])
+        self.assertEqual(engine.pending, 1)
+        result = engine.complete_descriptor(0, 2, generation=1,
+                                            bytes_done=4)
+
+        # output follows actual (out-of-order) completion order: 5 then 7
+        # then 2.
+        self.assertEqual(engine.output,
+                         SOURCE[8:12] + SOURCE[16:20] + SOURCE[0:4])
+        # Result descriptors follow submission order.
+        self.assertEqual(result.status, "ok")
+        self.assertEqual(result.request_id, 0)
+        self.assertEqual([d.index for d in result.descriptors], [2, 5, 7])
+        self.assertTrue(all(d.status == "ok" for d in result.descriptors))
+        self.assertEqual(result.bytes_copied, 12)
+        self.assertEqual(engine.pending, 0)
+        self.assertEqual(engine.results, [result])
+        for idx in (2, 5, 7):
+            self.assertEqual(ring.completion_count(idx), 1)
+            self.assertEqual(ring.cpu_acquire(idx).status, "ok")
+
+    def test_single_descriptor_request_is_boundary_case(self):
+        ring = make_ring()
+        release_descriptors(ring, [(3, 40, 5)])
+        engine = RequestEngine(ring)
+        engine.submit_request([3])
+        result = engine.complete_descriptor(0, 3, generation=1, bytes_done=5)
+        self.assertEqual(result.status, "ok")
+        self.assertEqual([d.index for d in result.descriptors], [3])
+        self.assertEqual(engine.output, SOURCE[40:45])
+
+    def test_zero_length_descriptor_counts_as_completed(self):
+        ring = make_ring()
+        release_descriptors(ring, [(0, 10, 0), (1, 10, 3)])
+        engine = RequestEngine(ring)
+        engine.submit_request([0, 1])
+        engine.complete_descriptor(0, 0, generation=1, bytes_done=0)
+        result = engine.complete_descriptor(0, 1, generation=1,
+                                            bytes_done=3)
+        self.assertEqual(result.status, "ok")
+        self.assertEqual(result.bytes_copied, 3)
+        self.assertEqual(engine.output, SOURCE[10:13])
+
+    def test_request_fills_entire_ring(self):
+        ring = make_ring(capacity=4, pool_size=256)
+        specs = [(i, i * 4, 4) for i in range(4)]
+        release_descriptors(ring, specs)
+        engine = RequestEngine(ring)
+        snaps = engine.submit_request([0, 1, 2, 3])
+        self.assertEqual(len(snaps), 4)
+        result = None
+        for idx in (3, 1, 0, 2):  # arbitrary order
+            result = engine.complete_descriptor(0, idx, generation=1,
+                                                bytes_done=4)
+        self.assertEqual(result.status, "ok")
+        expected = b"".join(SOURCE[i * 4:i * 4 + 4] for i in (3, 1, 0, 2))
+        self.assertEqual(engine.output, expected)
+        self.assertEqual(result.bytes_copied, 16)
+
+    def test_two_concurrent_requests_finish_independently(self):
+        ring = make_ring()
+        release_descriptors(ring, [(0, 0, 4), (1, 4, 4),
+                                   (2, 8, 4), (3, 12, 4)])
+        engine = RequestEngine(ring)
+        engine.submit_request([0, 1], request_id=10)
+        engine.submit_request([2, 3], request_id=11)
+        self.assertEqual(engine.pending, 2)
+        # Request 11 finishes first even though submitted second.
+        r11 = engine.complete_descriptor(11, 2, generation=1, bytes_done=4)
+        self.assertIsNone(r11)
+        r11 = engine.complete_descriptor(11, 3, generation=1, bytes_done=4)
+        self.assertEqual(r11.request_id, 11)
+        self.assertEqual(engine.pending, 1)
+        r10 = engine.complete_descriptor(10, 1, generation=1, bytes_done=4)
+        r10 = engine.complete_descriptor(10, 0, generation=1, bytes_done=4)
+        self.assertEqual([r.request_id for r in engine.results], [11, 10])
+        self.assertEqual(engine.output,
+                         SOURCE[8:12] + SOURCE[12:16]
+                         + SOURCE[4:8] + SOURCE[0:4])
+
+
+class TestRequestGenerations(unittest.TestCase):
+    def test_wrong_generation_rejected_as_stale(self):
+        ring = make_ring()
+        release_descriptors(ring, [(0, 0, 4), (1, 4, 4)])
+        engine = RequestEngine(ring)
+        engine.submit_request([0, 1])
+        for wrong_gen in (0, 2):
+            with self.assertRaises(RequestError) as ctx:
+                engine.complete_descriptor(0, 0, generation=wrong_gen,
+                                           bytes_done=4)
+            self.assertEqual(ctx.exception.reason, "stale-generation")
+            self.assertEqual(ctx.exception.index, 0)
+        # Rejected calls change nothing: slot still held, request pending.
+        self.assertTrue(ring.inspect(0)["device_held"])
+        self.assertEqual(engine.request_snapshot(0)["remaining"], (0, 1))
+        self.assertEqual(engine.output, b"")
+        # Correct generation still works.
+        engine.complete_descriptor(0, 0, generation=1, bytes_done=4)
+        engine.complete_descriptor(0, 1, generation=1, bytes_done=4)
+        self.assertEqual(engine.results[-1].status, "ok")
+
+    def test_stale_completion_after_ring_wrap_reuse(self):
+        ring = DmaRing(2, 16)
+        ring.pool[:] = SOURCE[:16]
+        release_descriptors(ring, [(0, 0, 2), (1, 2, 2)])
+        engine = RequestEngine(ring)
+        first = engine.submit_request([0, 1])
+        self.assertEqual([s.generation for s in first], [1, 1])
+        engine.complete_descriptor(0, 0, generation=1, bytes_done=2)
+        engine.complete_descriptor(0, 1, generation=1, bytes_done=2)
+
+        # CPU recycles both slots around the ring: generation 2.
+        recycle(ring, [0, 1])
+        release_descriptors(ring, [(0, 4, 2), (1, 6, 2)])
+        second = engine.submit_request([0, 1])
+        self.assertEqual([s.generation for s in second], [2, 2])
+        with self.assertRaises(RequestError) as ctx:
+            engine.complete_descriptor(1, 0, generation=1, bytes_done=2)
+        self.assertEqual(ctx.exception.reason, "stale-generation")
+        # New generation accepted.
+        engine.complete_descriptor(1, 0, generation=2, bytes_done=2)
+        result = engine.complete_descriptor(1, 1, generation=2,
+                                            bytes_done=2)
+        self.assertEqual(result.status, "ok")
+        self.assertEqual(ring.completion_count(0), 2)
+
+    def test_duplicate_completion_rejected(self):
+        ring = make_ring()
+        release_descriptors(ring, [(0, 0, 4), (1, 4, 4)])
+        engine = RequestEngine(ring)
+        engine.submit_request([0, 1])
+        engine.complete_descriptor(0, 0, generation=1, bytes_done=4)
+        with self.assertRaises(RequestError) as ctx:
+            engine.complete_descriptor(0, 0, generation=1, bytes_done=4)
+        self.assertEqual(ctx.exception.reason, "duplicate-completion")
+        # No double bytes, no premature publication.
+        self.assertEqual(engine.output, SOURCE[0:4])
+        self.assertEqual(engine.pending, 1)
+        self.assertEqual(ring.completion_count(0), 1)
+        engine.complete_descriptor(0, 1, generation=1, bytes_done=4)
+        self.assertEqual(engine.results[-1].status, "ok")
+
+    def test_completion_after_request_finished_is_unknown_request(self):
+        ring = make_ring()
+        release_descriptors(ring, [(0, 0, 4)])
+        engine = RequestEngine(ring)
+        engine.submit_request([0])
+        engine.complete_descriptor(0, 0, generation=1, bytes_done=4)
+        with self.assertRaises(RequestError) as ctx:
+            engine.complete_descriptor(0, 0, generation=1, bytes_done=4)
+        self.assertEqual(ctx.exception.reason, "unknown-request")
+
+    def test_index_not_in_request_rejected(self):
+        ring = make_ring()
+        release_descriptors(ring, [(0, 0, 4), (1, 4, 4)])
+        engine = RequestEngine(ring)
+        engine.submit_request([0], request_id=5)
+        engine.submit_request([1], request_id=6)
+        with self.assertRaises(RequestError) as ctx:
+            engine.complete_descriptor(5, 1, generation=1, bytes_done=4)
+        self.assertEqual(ctx.exception.reason, "not-in-request")
+        # Request 6's descriptor is untouched.
+        self.assertEqual(engine.request_snapshot(6)["remaining"], (1,))
+
+    def test_generation_bool_rejected(self):
+        ring = make_ring()
+        release_descriptors(ring, [(0, 0, 4)])
+        engine = RequestEngine(ring)
+        engine.submit_request([0])
+        with self.assertRaises(TypeError):
+            engine.complete_descriptor(0, 0, generation=True, bytes_done=4)
+
+
+class TestRequestErrorsAndRelease(unittest.TestCase):
+    def test_error_descriptor_skips_remaining_and_releases_slots(self):
+        ring = make_ring()
+        release_descriptors(ring, [(0, 0, 4), (1, 4, 4),
+                                   (2, 8, 4), (3, 12, 4)])
+        engine = RequestEngine(ring)
+        engine.submit_request([0, 1, 2, 3])
+        # Two descriptors finish ok (half-completed request), then an error.
+        engine.complete_descriptor(0, 1, generation=1, bytes_done=4)
+        engine.complete_descriptor(0, 3, generation=1, bytes_done=4)
+        result = engine.complete_descriptor(
+            0, 0, generation=1, status="error", error="device fault")
+        self.assertEqual(result.status, "error")
+        self.assertEqual(result.error_index, 0)
+        self.assertEqual(result.error, "device fault")
+        statuses = {d.index: d.status for d in result.descriptors}
+        self.assertEqual(statuses, {0: "error", 1: "ok",
+                                    2: "skipped", 3: "ok"})
+        # Only the two ok descriptors copied bytes.
+        self.assertEqual(result.bytes_copied, 8)
+        self.assertEqual(engine.output, SOURCE[4:8] + SOURCE[12:16])
+        # Request is gone and every occupied slot is back with the CPU.
+        self.assertEqual(engine.pending, 0)
+        for idx in (0, 1, 2, 3):
+            info = ring.inspect(idx)
+            self.assertEqual(info["owner"], "cpu")
+            self.assertFalse(info["device_held"])
+        self.assertEqual(ring.cpu_acquire(2).status, "skipped")
+        self.assertEqual(ring.completion_count(2), 1)
+        self.assertEqual(ring.cpu_acquire(0).status, "error")
+
+    def test_error_on_first_descriptor_skips_all_others(self):
+        ring = make_ring()
+        release_descriptors(ring, [(0, 0, 4), (1, 4, 4), (2, 8, 4)])
+        engine = RequestEngine(ring)
+        engine.submit_request([0, 1, 2])
+        result = engine.complete_descriptor(
+            0, 1, generation=1, status="error", error="bad")
+        self.assertEqual([d.status for d in result.descriptors],
+                         ["skipped", "error", "skipped"])
+        self.assertEqual(result.bytes_copied, 0)
+        self.assertEqual(engine.output, b"")
+        for idx in (0, 1, 2):
+            self.assertEqual(ring.inspect(idx)["owner"], "cpu")
+
+    def test_other_concurrent_request_unaffected_by_abort(self):
+        ring = make_ring()
+        release_descriptors(ring, [(0, 0, 4), (1, 4, 4), (2, 8, 4)])
+        engine = RequestEngine(ring)
+        engine.submit_request([0, 2], request_id=7)
+        engine.submit_request([1], request_id=8)
+        bad = engine.complete_descriptor(
+            7, 0, generation=1, status="error", error="fault")
+        self.assertEqual(bad.status, "error")
+        # Request 8 still pending; finish it normally.
+        ok = engine.complete_descriptor(8, 1, generation=1, bytes_done=4)
+        self.assertEqual(ok.status, "ok")
+        self.assertEqual(engine.output, SOURCE[4:8])
+
+    def test_invalid_error_payload_rejected_without_state_change(self):
+        ring = make_ring()
+        release_descriptors(ring, [(0, 0, 4), (1, 4, 4)])
+        engine = RequestEngine(ring)
+        engine.submit_request([0, 1])
+        # error status needs a message: ring validation propagates.
+        with self.assertRaises(ValueError):
+            engine.complete_descriptor(0, 0, generation=1, status="error")
+        # bytes_done beyond descriptor length likewise.
+        with self.assertRaises(ValueError):
+            engine.complete_descriptor(0, 0, generation=1, bytes_done=5)
+        # Nothing happened: descriptor still pending and device-held.
+        self.assertEqual(engine.request_snapshot(0)["remaining"], (0, 1))
+        self.assertTrue(ring.inspect(0)["device_held"])
+        self.assertEqual(engine.output, b"")
+        # Same descriptor can then complete ok.
+        result = engine.complete_descriptor(0, 0, generation=1, bytes_done=4)
+        self.assertIsNone(result)
+        engine.complete_descriptor(0, 1, generation=1, bytes_done=4)
+        self.assertEqual(engine.results[-1].status, "ok")
+
+    def test_unknown_request_completion_rejected(self):
+        ring = make_ring()
+        release_descriptors(ring, [(0, 0, 4)])
+        engine = RequestEngine(ring)
+        engine.submit_request([0])
+        with self.assertRaises(RequestError) as ctx:
+            engine.complete_descriptor(99, 0, generation=1, bytes_done=4)
+        self.assertEqual(ctx.exception.reason, "unknown-request")
+        # The pending request is untouched.
+        self.assertEqual(engine.request_snapshot(0)["remaining"], (0,))
+
+
+class TestRequestSubmissionValidation(unittest.TestCase):
+    def test_empty_request_rejected(self):
+        ring = make_ring()
+        engine = RequestEngine(ring)
+        with self.assertRaises(RequestError) as ctx:
+            engine.submit_request([])
+        self.assertEqual(ctx.exception.reason, "empty-request")
+        self.assertEqual(engine.pending, 0)
+
+    def test_duplicate_descriptor_in_one_submission_rejected(self):
+        ring = make_ring()
+        release_descriptors(ring, [(0, 0, 4), (1, 4, 4)])
+        engine = RequestEngine(ring)
+        with self.assertRaises(RequestError) as ctx:
+            engine.submit_request([0, 1, 0])
+        self.assertEqual(ctx.exception.reason, "duplicate-descriptor")
+        self.assertFalse(ring.inspect(0)["device_held"])
+        self.assertFalse(ring.inspect(1)["device_held"])
+
+    def test_descriptor_not_released_rejects_whole_request(self):
+        ring = make_ring()
+        write_and_release(ring, 0, offset=0, length=4)
+        ring.cpu_write(1, offset=4, length=4)  # staged, never released
+        engine = RequestEngine(ring)
+        with self.assertRaises(RequestError) as ctx:
+            engine.submit_request([0, 1])
+        self.assertEqual(ctx.exception.reason, "descriptor-unavailable")
+        # Atomicity: the otherwise-valid descriptor 0 was not acquired.
+        self.assertFalse(ring.inspect(0)["device_held"])
+        self.assertEqual(engine.pending, 0)
+        # It can still be submitted once the bad one is fixed.
+        ring.cpu_release(1)
+        engine.submit_request([0, 1])
+        self.assertEqual(engine.pending, 1)
+
+    def test_buffer_out_of_range_rejected_at_submission(self):
+        ring = DmaRing(4, 16)
+        ring.pool[:] = SOURCE[:16]
+        write_and_release(ring, 0, offset=0, length=8)
+        write_and_release(ring, 1, offset=8, length=16)  # 8+16 > 16
+        engine = RequestEngine(ring)
+        with self.assertRaises(RequestError) as ctx:
+            engine.submit_request([0, 1])
+        self.assertEqual(ctx.exception.reason, "buffer-out-of-range")
+        self.assertEqual(ctx.exception.index, 1)
+        self.assertFalse(ring.inspect(0)["device_held"])
+
+    def test_descriptor_already_in_another_request_rejected(self):
+        ring = make_ring()
+        release_descriptors(ring, [(0, 0, 4), (1, 4, 4)])
+        engine = RequestEngine(ring)
+        engine.submit_request([0])
+        with self.assertRaises(RequestError) as ctx:
+            engine.submit_request([0, 1])
+        self.assertEqual(ctx.exception.reason, "descriptor-busy")
+        # Descriptor 1 was not grabbed by the failed submission.
+        self.assertFalse(ring.inspect(1)["device_held"])
+        self.assertEqual(engine.request_snapshot(0)["remaining"], (0,))
+
+    def test_failed_submission_does_not_consume_request_id(self):
+        ring = make_ring()
+        engine = RequestEngine(ring)
+        with self.assertRaises(RequestError):
+            engine.submit_request([])  # would have consumed id 0
+        write_and_release(ring, 0, offset=0, length=4)
+        engine.submit_request([0])  # must still be id 0
+        result = engine.complete_descriptor(0, 0, generation=1, bytes_done=4)
+        self.assertEqual(result.request_id, 0)
+
+    def test_explicit_request_id_rules(self):
+        ring = make_ring()
+        release_descriptors(ring, [(0, 0, 4), (1, 4, 4)])
+        engine = RequestEngine(ring)
+        engine.submit_request([0], request_id=3)
+        with self.assertRaises(RequestError):
+            engine.submit_request([1], request_id=3)
+        with self.assertRaises(ValueError):
+            engine.submit_request([1], request_id=-1)
+        with self.assertRaises(TypeError):
+            engine.submit_request([1], request_id=True)
+        # Auto ids continue above the highest explicit id used.
+        engine.submit_request([1])
+        self.assertEqual(engine.request_snapshot(4)["order"], (1,))
+
+    def test_bad_index_in_submission_locates_error(self):
+        ring = make_ring()
+        engine = RequestEngine(ring)
+        with self.assertRaises(IndexError):
+            engine.submit_request([8])
+        with self.assertRaises(TypeError):
+            engine.submit_request([True])
 
 
 if __name__ == "__main__":
