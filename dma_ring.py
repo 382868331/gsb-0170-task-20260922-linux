@@ -24,6 +24,17 @@ validates a whole chain up front; ``CopyEngine`` validates incrementally
 while copying.  A bad descriptor completes its chain with an error and the
 engine halts without consuming subsequent queued chains.
 
+Requests: a request groups several explicitly listed descriptors.  The
+device may complete them in any order; each per-descriptor completion
+returns that slot to the CPU immediately, but the aggregate
+:class:`RequestResult` is published only once *all* members have completed.
+Membership records each slot's generation, so a replayed completion for a
+recycled slot is rejected as stale, and completing the same
+(request, slot, generation) twice is rejected as a duplicate.  An error
+completion finalises the whole request: every still-pending member is
+released back to the CPU with status ``skipped``, so an error request never
+leaves occupied slots behind (the ring can wrap immediately).
+
 Only the contract documented here is implemented; this is not a complete
 model of any industry-standard DMA controller.
 """
@@ -57,6 +68,40 @@ class VisibilityError(DmaRingError):
 
 class GenerationError(DmaRingError):
     """Expected generation did not match the committed generation (ABA)."""
+
+
+class DuplicateCompletionError(DmaRingError):
+    """A descriptor was completed twice for the same (request, generation).
+
+    Attributes:
+        request_id: the request the completion was submitted to.
+        index:      ring index of the descriptor.
+        generation: the generation recorded in the request membership.
+    """
+
+    def __init__(self, message: str, *, request_id, index, generation) -> None:
+        super().__init__(message)
+        self.request_id = request_id
+        self.index = index
+        self.generation = generation
+
+
+class RequestError(DmaRingError):
+    """A request is malformed or its lifecycle was violated.
+
+    Attributes:
+        request_id: id of the offending request, or ``None`` when the request
+                    was rejected at registration time.
+        index:      ring index of the offending member, if any.
+        reason:     short machine-stable reason string.
+    """
+
+    def __init__(self, message: str, *, request_id=None, index=None,
+                 reason: str | None = None) -> None:
+        super().__init__(message)
+        self.request_id = request_id
+        self.index = index
+        self.reason = reason
 
 
 class ChainError(DmaRingError):
@@ -125,6 +170,41 @@ class ChainResult:
     descriptors: tuple[int, ...]
 
 
+@dataclass(frozen=True)
+class RequestCompletion:
+    """One member descriptor's outcome inside a :class:`RequestResult`.
+
+    Members may complete out of order; records inside a ``RequestResult`` are
+    always presented in request (membership) order, not completion order.
+    """
+
+    index: int
+    generation: int
+    status: str            # "ok", "error" or "skipped"
+    error: str | None
+    bytes_done: int
+
+
+@dataclass(frozen=True)
+class RequestResult:
+    """Aggregate outcome of a multi-descriptor request.
+
+    Published only after every member has completed.  ``status`` is ``ok``
+    exactly when every member completed ``ok``; otherwise it is ``error`` and
+    ``error_index`` names the first descriptor that completed with an error.
+    Members still outstanding when the request is finalised on an error are
+    force-released with status ``skipped``; their slots return to the CPU so
+    the ring can wrap, but no bytes are copied for them.
+    """
+
+    request_id: int
+    status: str            # "ok" or "error"
+    error: str | None
+    error_index: int | None
+    bytes_copied: int
+    completions: tuple[RequestCompletion, ...]
+
+
 # ---------------------------------------------------------------------------
 # Input validation helpers
 # ---------------------------------------------------------------------------
@@ -172,6 +252,7 @@ class _Slot:
         "p_offset", "p_length", "p_next",    # pending (staged by CPU)
         "completion",                        # committed completion triple
         "completions",                       # lifetime completion count
+        "request_id",                        # active request owning this slot
     )
 
     def __init__(self) -> None:
@@ -187,6 +268,39 @@ class _Slot:
         self.p_next = None
         self.completion: tuple[str, str | None, int] | None = None
         self.completions = 0
+        self.request_id: int | None = None
+
+
+# ---------------------------------------------------------------------------
+# In-flight request (internal)
+# ---------------------------------------------------------------------------
+
+class _Request:
+    """A registered multi-descriptor request and its completion bookkeeping.
+
+    ``members`` preserves request (membership) order: the
+    :class:`RequestResult` is presented in that order regardless of the
+    actual completion order.  ``pending`` counts descriptors not yet
+    accounted for (a normal completion or the first error each accounts for
+    exactly one); the request publishes as soon as it reaches zero.
+    """
+
+    __slots__ = (
+        "request_id", "members", "gens", "pending", "results",
+        "finished", "status", "error", "error_index",
+    )
+
+    def __init__(self, request_id: int, members: list[tuple[int, int]]) -> None:
+        self.request_id = request_id
+        self.members = members                    # [(index, generation)] in order
+        self.gens = {idx: gen for idx, gen in members}
+        self.pending = len(members)
+        # index -> RequestCompletion, keyed while the request is in flight
+        self.results: dict[int, RequestCompletion] = {}
+        self.finished = False
+        self.status = "ok"
+        self.error: str | None = None
+        self.error_index: int | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -210,6 +324,11 @@ class DmaRing:
             raise ValueError(f"pool_size: must be >= 0, got {pool_size}")
         self.pool = bytearray(pool_size)
         self._slots = [_Slot() for _ in range(self.capacity)]
+        # request_id -> _Request for in-flight (not yet finalised) requests
+        self._requests: dict[int, _Request] = {}
+        # request_id -> RequestResult awaiting cpu request_acquire
+        self._request_results: dict[int, RequestResult] = {}
+        self._next_request_id = 1
 
     # -- internal helpers --------------------------------------------------
 
@@ -340,10 +459,71 @@ class DmaRing:
         return DescriptorSnapshot(
             i, slot.generation, slot.offset, slot.length, slot.next)
 
-    def device_release(self, index, *, status, bytes_done=0, error=None
-                       ) -> None:
-        """Publish a completion and hand the descriptor back to the CPU."""
+    def device_release(self, index, *, status, bytes_done=0, error=None,
+                       request_id=None) -> None:
+        """Publish a completion and hand the descriptor back to the CPU.
+
+        Without ``request_id`` this is the plain per-descriptor release
+        (unchanged semantics).  With ``request_id`` the completion is
+        accounted against that request's membership:
+
+        * the slot must belong to the request (else :class:`RequestError`),
+        * the generation recorded at registration must still match the
+          slot's committed generation — a mismatch means the slot was
+          recycled and this completion is *stale* (:class:`GenerationError`),
+        * the same (request, slot, generation) may complete only once —
+          a replayed completion raises :class:`DuplicateCompletionError`.
+
+        Request-scoped replay/stale checks run *before* the ownership check
+        so a duplicate or stale completion is reported as such even when the
+        slot has meanwhile been handed back to the CPU.
+        """
         slot, i = self._slot(index)
+        req: _Request | None = None
+        if request_id is not None:
+            rid = _as_int(request_id, "request_id")
+            req = self._requests.get(rid)
+            if req is None:
+                finished = self._request_results.get(rid)
+                if finished is not None:
+                    for comp in finished.completions:
+                        if comp.index == i:
+                            if slot.generation != comp.generation:
+                                raise GenerationError(
+                                    f"descriptor {i}: request {rid} "
+                                    f"finished at generation "
+                                    f"{comp.generation}; slot has been "
+                                    f"recycled to generation "
+                                    f"{slot.generation} (stale completion)")
+                            raise DuplicateCompletionError(
+                                f"descriptor {i}: request {rid} already "
+                                f"recorded this completion "
+                                f"(generation {comp.generation})",
+                                request_id=rid, index=i,
+                                generation=comp.generation)
+                raise RequestError(
+                    f"descriptor {i}: request {rid} is not in flight",
+                    request_id=rid, index=i, reason="unknown-request")
+            if i not in req.gens:
+                raise RequestError(
+                    f"descriptor {i}: not a member of request {rid}",
+                    request_id=rid, index=i, reason="not-a-member")
+            if req.gens[i] != slot.generation:
+                raise GenerationError(
+                    f"descriptor {i}: request {rid} recorded generation "
+                    f"{req.gens[i]}, committed generation is "
+                    f"{slot.generation} (stale completion)")
+            if i in req.results:
+                raise DuplicateCompletionError(
+                    f"descriptor {i}: request {rid} already completed this "
+                    f"(slot, generation {req.gens[i]})",
+                    request_id=rid, index=i, generation=req.gens[i])
+        elif slot.request_id is not None:
+            raise RequestError(
+                f"descriptor {i}: belongs to request {slot.request_id}; "
+                f"release it with request_id={slot.request_id}",
+                request_id=slot.request_id, index=i,
+                reason="request-owned-slot")
         if slot.owner is not Owner.DEVICE or not slot.device_held:
             raise OwnershipError(
                 f"descriptor {i}: device cannot release "
@@ -352,6 +532,11 @@ class DmaRing:
             raise ValueError(
                 f"descriptor {i}: status must be one of {VALID_STATUSES}, "
                 f"got {status!r}")
+        if req is not None and status == "skipped":
+            raise ValueError(
+                f"descriptor {i}: status 'skipped' is reserved for the "
+                f"ring's force-release when a request fails; members are "
+                f"completed with 'ok' or 'error'")
         bytes_done = _as_int(bytes_done, "bytes_done")
         if not 0 <= bytes_done <= slot.length:
             raise ValueError(
@@ -368,6 +553,152 @@ class DmaRing:
         slot.completions += 1
         slot.device_held = False
         slot.owner = Owner.CPU
+        slot.request_id = None
+        if req is not None:
+            req.results[i] = RequestCompletion(
+                i, req.gens[i], status, error, bytes_done)
+            req.pending -= 1
+            if status == "error":
+                self._finish_request_error(req, i, error)
+            elif req.pending == 0:
+                self._publish_request(req)
+
+    # -- requests ------------------------------------------------------------
+
+    def register_request(self, indices) -> tuple[int, tuple[int, ...]]:
+        """Register a multi-descriptor request over already-released slots.
+
+        ``indices`` is a list/tuple of ring indices, in request order; every
+        slot must currently be owned by the device (i.e. the CPU has
+        called ``cpu_release`` on it).  Each slot's committed generation is
+        recorded now; any later completion carrying a different generation is
+        rejected as stale.
+
+        Returns ``(request_id, generations)`` where ``generations`` parallels
+        ``indices``.  All validation happens before any state changes, so a
+        rejected call leaves the ring untouched.
+        """
+        if not isinstance(indices, (list, tuple)):
+            raise TypeError(
+                f"indices: expected list or tuple of ring indices, got "
+                f"{type(indices).__name__}")
+        if not indices:
+            raise ValueError("indices: a request needs at least one member")
+        parsed: list[int] = []
+        for raw in indices:
+            slot, idx = self._slot(raw)   # validates type and range
+            parsed.append(idx)
+        if len(set(parsed)) != len(parsed):
+            dup = next(i for i in parsed if parsed.count(i) > 1)
+            raise RequestError(
+                f"request: index {dup} listed more than once",
+                index=dup, reason="duplicate-member")
+        for idx in parsed:
+            slot = self._slots[idx]
+            if slot.owner is not Owner.DEVICE:
+                raise RequestError(
+                    f"descriptor {idx}: not released to device "
+                    f"(owner={slot.owner.value})",
+                    index=idx, reason="not-device-owned")
+            if slot.device_held:
+                raise RequestError(
+                    f"descriptor {idx}: device already holds this slot",
+                    index=idx, reason="device-held")
+            if slot.request_id is not None:
+                raise RequestError(
+                    f"descriptor {idx}: already belongs to request "
+                    f"{slot.request_id}",
+                    request_id=slot.request_id, index=idx,
+                    reason="already-in-request")
+        rid = self._next_request_id
+        self._next_request_id += 1
+        members = [(idx, self._slots[idx].generation) for idx in parsed]
+        self._requests[rid] = _Request(rid, members)
+        for idx in parsed:
+            self._slots[idx].request_id = rid
+        return rid, tuple(gen for _, gen in members)
+
+    def request_is_done(self, request_id) -> bool:
+        """True once the request's aggregate result has been published."""
+        rid = _as_int(request_id, "request_id")
+        if rid in self._requests:
+            return False
+        if rid in self._request_results:
+            return True
+        raise RequestError(
+            f"request {rid}: unknown request id",
+            request_id=rid, reason="unknown-request")
+
+    def request_acquire(self, request_id) -> RequestResult:
+        """Read a finished request's aggregate result.
+
+        Raises :class:`RequestError` while the request is still in flight
+        (result not yet published) or if the id is unknown.  The result stays
+        readable afterwards (idempotent).
+        """
+        rid = _as_int(request_id, "request_id")
+        if rid in self._requests:
+            raise RequestError(
+                f"request {rid}: still in flight "
+                f"({self._requests[rid].pending} descriptor(s) pending)",
+                request_id=rid, reason="in-flight")
+        try:
+            return self._request_results[rid]
+        except KeyError:
+            raise RequestError(
+                f"request {rid}: unknown request id",
+                request_id=rid, reason="unknown-request") from None
+
+    def _publish_request(self, req: _Request) -> None:
+        """Assemble and publish the aggregate result of a finished request."""
+        req.finished = True
+        completions = tuple(req.results[idx] for idx, _ in req.members)
+        bytes_copied = sum(c.bytes_done for c in completions
+                           if c.status == "ok")
+        result = RequestResult(
+            request_id=req.request_id, status=req.status, error=req.error,
+            error_index=req.error_index, bytes_copied=bytes_copied,
+            completions=completions)
+        self._request_results[req.request_id] = result
+        del self._requests[req.request_id]
+
+    def _finish_request_error(self, req: _Request, index: int,
+                              error: str | None) -> None:
+        """Finalise a request on an error completion.
+
+        Members not yet completed are force-released back to the CPU with
+        status ``skipped`` (bytes_done=0): their slots are freed so the ring
+        can wrap and be reused, and the aggregate result is published at
+        once.  Only the first error finalises the request.
+        """
+        if req.finished:
+            return
+        req.finished = True
+        req.status = "error"
+        req.error = error
+        req.error_index = index
+        for idx, gen in req.members:
+            if idx in req.results:
+                continue
+            slot = self._slots[idx]
+            # Normal protocol invariant: a pending member is still owned by
+            # this request at the recorded generation (the CPU cannot
+            # recycle a device-owned slot).  If a caller violated ownership
+            # out-of-band and the slot has moved on, do not clobber it: it is
+            # still accounted as skipped in the aggregate result.
+            if slot.request_id != req.request_id or slot.generation != gen:
+                req.results[idx] = RequestCompletion(
+                    idx, gen, "skipped", None, 0)
+                req.pending -= 1
+                continue
+            slot.completion = ("skipped", None, 0)
+            slot.completions += 1
+            slot.device_held = False
+            slot.owner = Owner.CPU
+            slot.request_id = None
+            req.results[idx] = RequestCompletion(idx, gen, "skipped", None, 0)
+            req.pending -= 1
+        self._publish_request(req)
 
     # -- chain validation / introspection -----------------------------------
 
@@ -431,6 +762,7 @@ class DmaRing:
             "next": slot.next,
             "completion": slot.completion,
             "completions": slot.completions,
+            "request_id": slot.request_id,
         }
 
 
@@ -451,6 +783,15 @@ class CopyEngine:
     :meth:`reset_halt` is called.  Descriptors completed before the bad one
     keep their ``ok`` completions and copied bytes (documented partial
     completion semantics).
+
+    Requests: :meth:`submit_request` registers a multi-descriptor request
+    (see :meth:`DmaRing.register_request`) and queues it.  Members are
+    processed in ``order`` (default: request order) — the device may
+    complete them out of order; the aggregate :class:`RequestResult` is
+    published by the ring only when all members are accounted for, and is
+    mirrored into :attr:`request_results`.  A bad member is released with
+    status ``error``; the ring then force-releases the remaining members as
+    ``skipped`` and the engine halts exactly as for a broken chain.
     """
 
     def __init__(self, ring: DmaRing) -> None:
@@ -459,8 +800,10 @@ class CopyEngine:
                 f"ring: expected DmaRing, got {type(ring).__name__}")
         self.ring = ring
         self._output = bytearray()
-        self._queue: deque[int] = deque()
+        # queue entries: ("chain", head) or ("request", request_id, order)
+        self._queue: deque[tuple] = deque()
         self.results: list[ChainResult] = []
+        self.request_results: list[RequestResult] = []
         self.halted = False
 
     @property
@@ -470,7 +813,7 @@ class CopyEngine:
 
     @property
     def queued(self) -> int:
-        """Number of submitted chains not yet processed."""
+        """Number of submitted chains/requests not yet processed."""
         return len(self._queue)
 
     def submit_chain(self, head) -> None:
@@ -480,13 +823,55 @@ class CopyEngine:
             raise OwnershipError(
                 f"chain head {head}: not released to device "
                 f"(owner={slot.owner.value})")
-        self._queue.append(head)
+        if slot.request_id is not None:
+            raise RequestError(
+                f"chain head {head}: already belongs to request "
+                f"{slot.request_id}",
+                request_id=slot.request_id, index=head,
+                reason="already-in-request")
+        self._queue.append(("chain", head))
+
+    def submit_request(self, indices, *, order=None) -> int:
+        """Register and queue a multi-descriptor request; return its id.
+
+        ``indices`` lists the member slots in request order (each must have
+        been released by ``cpu_release``).  ``order``, if given, is a
+        permutation of ``indices`` fixing the device's completion order —
+        out-of-order completion is legal.  All validation happens before
+        anything is queued, so a rejected call changes nothing.
+        """
+        if not isinstance(indices, (list, tuple)):
+            raise TypeError(
+                f"indices: expected list or tuple of ring indices, got "
+                f"{type(indices).__name__}")
+        members = [self.ring._slot(raw)[1] for raw in indices]
+        proc_order = members
+        if order is not None:
+            if not isinstance(order, (list, tuple)):
+                raise TypeError(
+                    f"order: expected list or tuple of ring indices, got "
+                    f"{type(order).__name__}")
+            proc_order = [self.ring._slot(raw)[1] for raw in order]
+            if sorted(proc_order) != sorted(members):
+                raise RequestError(
+                    f"order {list(order)!r} is not a permutation of the "
+                    f"request members {list(indices)!r}",
+                    reason="bad-order")
+        # register_request performs the duplicate/ownership checks atomically;
+        # only after it succeeds do we mutate the queue.
+        rid, _gens = self.ring.register_request(members)
+        self._queue.append(("request", rid, proc_order))
+        return rid
 
     def run(self) -> None:
-        """Process queued chains in order until the queue drains or a chain
-        error halts the engine."""
+        """Process queued chains/requests in order until the queue drains or
+        an error halts the engine."""
         while self._queue and not self.halted:
-            self._process_chain(self._queue.popleft())
+            entry = self._queue.popleft()
+            if entry[0] == "chain":
+                self._process_chain(entry[1])
+            else:
+                self._process_request(entry[1], entry[2])
 
     def reset_halt(self) -> None:
         """Clear the halt flag so queued chains can be processed again."""
@@ -519,6 +904,15 @@ class CopyEngine:
         done: list[int] = []
         copied = 0
         while idx is not None:
+            # idx is always in range here: the head was range-checked at
+            # submit, and each subsequent idx was range-checked by the
+            # previous descriptor's validation before traversal.
+            if ring._slots[idx].request_id is not None:
+                self._fail_chain(
+                    head, done, copied, idx,
+                    f"descriptor {idx}: belongs to request "
+                    f"{ring._slots[idx].request_id}")
+                return
             try:
                 snap = ring.device_acquire(idx)
             except OwnershipError as exc:
@@ -550,3 +944,32 @@ class CopyEngine:
             head=head, status="error", error=problem, error_index=idx,
             bytes_copied=copied, descriptors=tuple(done)))
         self.halted = True
+
+    def _process_request(self, rid: int, order: list[int]) -> None:
+        """Process one request, completing members in ``order``.
+
+        A request lists its members explicitly, so ``next`` pointers are not
+        traversed; only each member's buffer range is validated.  Bytes
+        copied by members completed ``ok`` before the first error remain in
+        the engine output; the ring accounts the rest as ``skipped``.
+        """
+        ring = self.ring
+        for idx in order:
+            snap = ring.device_acquire(idx)
+            end = snap.offset + snap.length
+            if end > len(ring.pool):
+                problem = (f"descriptor {idx}: buffer range "
+                           f"[{snap.offset}, {end}) exceeds pool size "
+                           f"{len(ring.pool)}")
+                # The ring finalises the whole request here: remaining
+                # members come back as "skipped" and their slots are freed.
+                ring.device_release(idx, status="error", error=problem,
+                                    bytes_done=0, request_id=rid)
+                self.request_results.append(ring.request_acquire(rid))
+                self.halted = True
+                return
+            data = bytes(ring.pool[snap.offset: snap.offset + snap.length])
+            self._output += data
+            ring.device_release(idx, status="ok", bytes_done=snap.length,
+                                request_id=rid)
+        self.request_results.append(ring.request_acquire(rid))
