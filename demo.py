@@ -1,10 +1,11 @@
-"""Demo: one correct DMA-ring copy and one real visibility rejection.
+"""Demo: one correct DMA-ring copy, one real visibility rejection, and one
+coalesced-notification run.
 
 Runs in well under 8 seconds, no sleeps, no recorded output.  All data is
 generated deterministically in-repo.
 """
 
-from dma_ring import CopyEngine, DmaRing, VisibilityError
+from dma_ring import CopyEngine, DmaRing, NotificationCoalescer, VisibilityError
 
 
 def main() -> None:
@@ -55,6 +56,48 @@ def main() -> None:
     comp = ring.cpu_acquire(1)
     print(f"legal handoff afterwards: status={comp.status} "
           f"bytes_done={comp.bytes_done}")
+
+    # --- 3. Coalesced completion notifications -----------------------------
+    # Threshold 3, timeout 4 ticks: one notification per 3 completions, or
+    # one when the oldest unnotified completion has waited 4 ticks.
+    ring2 = DmaRing(capacity=4, pool_size=64)
+    ring2.pool[:] = bytes((i * 5 + 1) % 256 for i in range(64))
+    coalescer = NotificationCoalescer(ring2, threshold=3, timeout=4)
+    engine2 = CopyEngine(ring2)
+
+    print("\n=== coalesced notifications (threshold=3, timeout=4) ===")
+    for idx in (0, 1, 2):
+        ring2.cpu_write(idx, offset=idx * 8, length=8)
+        ring2.cpu_release(idx)
+        engine2.submit_chain(idx)
+    engine2.run()  # 3 completions at t=0 -> one threshold notification
+
+    # Data visibility is NOT delayed: the CPU can acquire completion 0
+    # before any notification has been read.
+    early = ring2.cpu_acquire(0)
+    print(f"cpu_acquire before notification read: status={early.status} "
+          f"bytes_done={early.bytes_done} (visibility not delayed)")
+
+    note = coalescer.read()
+    print(f"t={note.time} [{note.reason}] "
+          f"records={[(r.index, r.generation, r.status) for r in note.records]}")
+    print(f"re-read consumes nothing: {coalescer.read()}")
+
+    # One more completion at t=0: below threshold, waits for the timeout.
+    ring2.cpu_write(3, offset=24, length=8)
+    ring2.cpu_release(3)
+    engine2.submit_chain(3)
+    engine2.run()
+    print(f"after 1 more completion: events_pending={coalescer.events_pending}"
+          f" pending_count={coalescer.pending_count}"
+          f" deadline={coalescer.next_deadline}")
+    fired = coalescer.advance(4)  # t=4 == deadline: boundary equality fires
+    for note in fired:
+        print(f"t={note.time} [{note.reason}] "
+              f"records={[(r.index, r.generation, r.status) for r in note.records]}")
+
+    # Explicit flush on an empty batch produces no event.
+    print(f"empty flush -> {coalescer.flush()}")
 
 
 if __name__ == "__main__":

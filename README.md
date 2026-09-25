@@ -12,8 +12,8 @@ CPU↔device 所有权交接协议。无真实硬件、无线程、无 I/O；描
 ## 运行
 
 ```sh
-python -m unittest discover -s tests -v   # 必要测试
-python demo.py                            # 一次正确复制 + 一次可见性拒绝（约 0.1 秒）
+python -m unittest discover -s tests -v   # 必要测试（所有权协议 + 通知合并器）
+python demo.py                            # 正确复制 + 可见性拒绝 + 通知合并演示（约 0.1 秒）
 ```
 
 ## 接口（`dma_ring.py`）
@@ -24,6 +24,10 @@ python demo.py                            # 一次正确复制 + 一次可见性
 - `CompletionSnapshot(index, generation, status, error, bytes_done)` — 已提交完成记录；
   `status ∈ {"ok", "error", "skipped"}`
 - `ChainResult(head, status, error, error_index, bytes_copied, descriptors)` — 单链处理结果
+- `CompletionRecord(index, generation, status, error, bytes_done, time)` — 合并通知中的
+  单条完成记录；身份为 `(index, generation)`，`time` 为完成时的逻辑时刻
+- `Notification(time, reason, records)` — 一次合并通知；
+  `reason ∈ {"threshold", "timeout", "flush"}`，`records` 按实际完成顺序排列
 - `Owner.{CPU, DEVICE}`
 
 ### `DmaRing(capacity, pool_size)`
@@ -43,6 +47,35 @@ python demo.py                            # 一次正确复制 + 一次可见性
 - 输出：`engine.output`（复制字节结果）、`engine.results`（`ChainResult` 列表）、
   `engine.queued`、`engine.halted`
 
+### `NotificationCoalescer(ring, *, threshold, timeout)`（通知合并器，可选）
+
+挂接到环上后，每次 `device_release`（含 `error` 完成）记录一条 `CompletionRecord`；
+满足以下任一条件即合并发出一次 `Notification`：
+
+- 未通知记录数达到 `threshold`（立即触发，时刻为触发记录的到达时刻）；
+- 最老未通知记录等待满 `timeout` 个逻辑滴答，即时钟到达
+  `首条记录时刻 + timeout`——边界相等即触发，由 `advance()` 检查；
+- 调用方显式 `flush()`。
+
+- `advance(ticks=1) -> list[Notification]`：推进逻辑时钟，返回本次触发的超时通知
+  （直接交付给调用方，不入队）
+- `flush() -> Notification | None`：立即发出当前批次；空 flush 无事件（返回 `None`）
+- `read() -> Notification | None` / `drain() -> list[Notification]`：消费队列中隐式
+  触发的（threshold）通知；读取消耗，重复读不会重新消费
+- 自省：`now`、`pending_count`、`next_deadline`、`events_pending`；`detach()` 解除挂接
+- `threshold`/`timeout` 为 ≥1 的整数（bool、非整浮点按模块惯例拒绝）
+
+```python
+ring = DmaRing(4, 64)
+coalescer = NotificationCoalescer(ring, threshold=3, timeout=4)
+# ... 正常走 cpu_write/cpu_release，由 CopyEngine 或手动 device_release 完成 ...
+note = coalescer.read()          # 满 3 条时：threshold 通知
+fired = coalescer.advance(4)     # 时钟到达截止时刻：timeout 通知（边界相等触发）
+tail = coalescer.flush()         # 不足阈值也未超时：显式冲刷
+```
+
+不挂接合并器的既有调用行为完全不变。
+
 ## 所有权与可见性协议
 
 1. CPU `cpu_write` 只写暂存视图；`cpu_release` 一次性提交（flush）并把所有权交给
@@ -52,6 +85,22 @@ python demo.py                            # 一次正确复制 + 一次可见性
 3. device 完成后 `device_release` 发布完成记录并归还 CPU。
 4. CPU 必须 `cpu_acquire` 后才能 `cpu_read_completion`；device 未 release 时
    `cpu_acquire` 抛 `OwnershipError`。
+
+## 通知合并语义（设计取舍）
+
+- **只合并通知，不延迟数据**：完成记录的发布与所有权归还仍发生在
+  `device_release`/`cpu_acquire` 原路径上；合并器只在发布之后被动记录，
+  `cpu_acquire` 在任何通知发出之前即可读到完成数据。
+- **触发条件**：计数阈值（达到立即发）或等待超时（首条未通知记录的时刻 +
+  `timeout`，`advance` 推进时钟时边界相等即触发）。同一时刻阈值与超时同时
+  满足只发一份——每条记录只属于一个批次，结构上不可能重复投递。
+- **记录内容**：设备错误同样计入；`records` 按实际完成顺序排列；槽位环绕复用
+  后以 `(index, generation)` 区分新旧记录，每个完成身份在所有通知中恰出现一次。
+- **交付路径**：隐式触发（`device_release` 内达到阈值）的通知入队，由
+  `read()`/`drain()` 消费；显式触发（`advance` 超时、`flush`）的通知由调用
+  直接返回，不再入队——每条通知恰好交付一次。
+- **逻辑时间**：仅由 `advance()` 驱动，无 sleep、无线程、无中断；不提供取消
+  请求语义。
 
 ## 错误语义（均可定位，不静默纠正）
 
@@ -97,3 +146,5 @@ NaN/Infinity（`ValueError`），整数参数拒绝 bool（`TypeError`），非�
 - 只实现本文档所述契约子集，不宣称兼容任何行业标准 DMA 控制器。
 - `inspect()` 绕过所有权规则，仅供测试/调试，不属于协议接口。
 - 引擎 halt 后已排队链保留在队列中，需显式 `reset_halt()` 才会继续。
+- 合并器的逻辑时钟不会自行前进，只能由调用方 `advance()` 推进；超时是否触发
+  取决于调用方推进时钟的时机（通知层面的延迟，不影响完成数据可见性）。
