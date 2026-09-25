@@ -24,6 +24,22 @@ validates a whole chain up front; ``CopyEngine`` validates incrementally
 while copying.  A bad descriptor completes its chain with an error and the
 engine halts without consuming subsequent queued chains.
 
+Two device models share the ring protocol:
+
+* ``CopyEngine`` — the original synchronous model: ``submit_chain`` +
+  ``run()`` processes whole chains to completion, halting on the first
+  descriptor error.
+* ``SteppedCopyEngine`` — a step-driven, cancellable model.  ``submit``
+  validates and freezes a chain's slots and generations and returns a
+  ``CopyRequest`` handle; each ``step()`` processes at most one descriptor
+  (or confirms one pending cancel).  ``CopyRequest.cancel()`` only
+  *registers* intent: the device confirms it on the next step, ending the
+  request and handing the not-yet-processed descriptors back to the CPU
+  through the normal release/acquire rules (status ``skipped``).  The
+  already-copied prefix is kept; the terminal ``CopyRequestResult``
+  distinguishes ``ok`` / ``error`` / ``cancelled`` and reports the actual
+  copied byte count.  All events are serial; no threads are involved.
+
 Only the contract documented here is implemented; this is not a complete
 model of any industry-standard DMA controller.
 """
@@ -75,6 +91,21 @@ class ChainError(DmaRingError):
         self.reason = reason
 
 
+class SlotBusyError(DmaRingError):
+    """A submit tried to occupy a slot held by another in-flight request.
+
+    Attributes:
+        index:      ring index of the contended slot.
+        request_id: id of the in-flight request currently occupying it.
+    """
+
+    def __init__(self, message: str, *, index: int | None = None,
+                 request_id: int | None = None) -> None:
+        super().__init__(message)
+        self.index = index
+        self.request_id = request_id
+
+
 # ---------------------------------------------------------------------------
 # Public data structures
 # ---------------------------------------------------------------------------
@@ -123,6 +154,34 @@ class ChainResult:
     error_index: int | None
     bytes_copied: int
     descriptors: tuple[int, ...]
+
+
+@dataclass(frozen=True)
+class CopyRequestResult:
+    """Terminal outcome of one :class:`SteppedCopyEngine` request.
+
+    ``status`` is one of:
+
+    * ``"ok"``        — the whole chain was copied;
+    * ``"error"``     — a descriptor failed device-side validation;
+    * ``"cancelled"`` — a registered cancel was confirmed by a step.
+
+    ``bytes_copied`` counts only bytes actually copied into the engine
+    output before the request ended; unprocessed descriptors contribute
+    nothing and are never counted as success.  ``descriptors`` is the
+    completed prefix (``ok`` completions, plus the failing descriptor for
+    ``status == "error"``); ``skipped`` lists the slots that were handed
+    back to the CPU unprocessed (completion status ``skipped``).
+    """
+
+    request_id: int
+    head: int
+    status: str            # "ok", "error" or "cancelled"
+    error: str | None
+    error_index: int | None
+    bytes_copied: int
+    descriptors: tuple[int, ...]
+    skipped: tuple[int, ...]
 
 
 # ---------------------------------------------------------------------------
@@ -438,6 +497,32 @@ class DmaRing:
 # Copy engine (synthesised device)
 # ---------------------------------------------------------------------------
 
+def _validate_copy_descriptor(ring: DmaRing, idx: int,
+                              snap: DescriptorSnapshot,
+                              seen: set[int]) -> str | None:
+    """Device-side descriptor check shared by both copy engines.
+
+    Returns an error string if the descriptor is bad (buffer range outside
+    the pool, invalid ``next`` pointer, or a cycle against ``seen``), else
+    ``None``.  ``seen`` must already contain the descriptors acquired
+    earlier in the same chain, including ``idx``.
+    """
+    end = snap.offset + snap.length
+    if end > len(ring.pool):
+        return (f"descriptor {idx}: buffer range "
+                f"[{snap.offset}, {end}) exceeds pool size "
+                f"{len(ring.pool)}")
+    nxt = snap.next
+    if nxt is not None:
+        if not isinstance(nxt, int) or isinstance(nxt, bool) \
+                or not 0 <= nxt < ring.capacity:
+            return (f"descriptor {idx}: next={nxt!r} is not a valid "
+                    f"ring index")
+        if nxt in seen:
+            return f"descriptor {idx}: next={nxt} forms a cycle"
+    return None
+
+
 class CopyEngine:
     """A synchronous device model that copies chain bytes into an output.
 
@@ -497,20 +582,7 @@ class CopyEngine:
     def _validate_descriptor(self, idx: int, snap: DescriptorSnapshot,
                              seen: set[int]) -> str | None:
         """Return an error string if the descriptor is bad, else ``None``."""
-        end = snap.offset + snap.length
-        if end > len(self.ring.pool):
-            return (f"descriptor {idx}: buffer range "
-                    f"[{snap.offset}, {end}) exceeds pool size "
-                    f"{len(self.ring.pool)}")
-        nxt = snap.next
-        if nxt is not None:
-            if not isinstance(nxt, int) or isinstance(nxt, bool) \
-                    or not 0 <= nxt < self.ring.capacity:
-                return (f"descriptor {idx}: next={nxt!r} is not a valid "
-                        f"ring index")
-            if nxt in seen:
-                return f"descriptor {idx}: next={nxt} forms a cycle"
-        return None
+        return _validate_copy_descriptor(self.ring, idx, snap, seen)
 
     def _process_chain(self, head: int) -> None:
         ring = self.ring
@@ -550,3 +622,276 @@ class CopyEngine:
             head=head, status="error", error=problem, error_index=idx,
             bytes_copied=copied, descriptors=tuple(done)))
         self.halted = True
+
+
+# ---------------------------------------------------------------------------
+# Stepped copy engine (cancellable, one descriptor per step)
+# ---------------------------------------------------------------------------
+
+class CopyRequest:
+    """Handle for one stepped copy request returned by
+    :meth:`SteppedCopyEngine.submit`.
+
+    The handle stays meaningful after the request ends — and after its
+    slots are recycled by a later generation: :meth:`result` always reports
+    *this* request's own terminal state, while :meth:`cancel` can only
+    register intent on *this* request and is a no-op once it has finished,
+    so a stale handle can never cancel a newer request reusing the slots.
+    """
+
+    __slots__ = (
+        "request_id", "head",
+        "_chain", "_generations", "_position", "_copied",
+        "_descriptors", "_seen",
+        "_cancel_requested", "_done", "_result",
+    )
+
+    def __init__(self, request_id: int, head: int, chain: tuple[int, ...],
+                 generations: tuple[int, ...]) -> None:
+        self.request_id = request_id
+        self.head = head
+        self._chain = chain
+        self._generations = generations
+        self._position = 0
+        self._copied = 0
+        self._descriptors: list[int] = []
+        self._seen: set[int] = set()
+        self._cancel_requested = False
+        self._done = False
+        self._result: CopyRequestResult | None = None
+
+    def __repr__(self) -> str:
+        state = "done" if self._done else "in-flight"
+        return (f"CopyRequest(request_id={self.request_id}, "
+                f"head={self.head}, {state})")
+
+    @property
+    def done(self) -> bool:
+        """Whether the request has reached its terminal state."""
+        return self._done
+
+    @property
+    def cancel_requested(self) -> bool:
+        """Whether cancel intent has been registered (not yet confirmed)."""
+        return self._cancel_requested
+
+    def cancel(self) -> bool:
+        """Register cancel intent; the device confirms it on the next step.
+
+        Returns ``True`` if intent was newly registered.  Returns ``False``
+        (changing nothing) when intent was already registered or the
+        request has already finished — completion is final and cannot be
+        rewritten by a later cancel.
+        """
+        if self._done or self._cancel_requested:
+            return False
+        self._cancel_requested = True
+        return True
+
+    def result(self) -> CopyRequestResult | None:
+        """The terminal result, or ``None`` while the request is in flight.
+
+        Repeated reads return the same object and change nothing.
+        """
+        return self._result
+
+
+class SteppedCopyEngine:
+    """A step-driven, cancellable device model sharing the ring protocol.
+
+    Unlike :class:`CopyEngine` (which processes whole chains inside one
+    ``run()`` call and halts on error), this engine exposes the device as a
+    serial sequence of single-descriptor steps so a caller can cancel an
+    in-flight request:
+
+    * :meth:`submit` validates the chain's structure, requires every slot
+      to be released to the device, freezes each slot's generation, and
+      returns a :class:`CopyRequest`.  Two in-flight requests may not
+      occupy the same slot (:class:`SlotBusyError`).
+    * :meth:`step` processes at most one event: it confirms the oldest
+      in-flight request's pending cancel, or copies that request's next
+      descriptor.  Events are serial; there are no threads.
+    * A registered cancel is confirmed by the *next* step: the request
+      ends as ``cancelled`` and its not-yet-processed descriptors are
+      handed back to the CPU through the normal release/acquire rules with
+      completion status ``skipped``.  The already-copied prefix is kept.
+    * If the last descriptor completes first, the request is ``ok`` and a
+      later :meth:`CopyRequest.cancel` changes nothing.
+    * A descriptor error ends only that request (status ``error``),
+      releasing its remaining slots as ``skipped``; disjoint in-flight
+      requests are unaffected, and this engine has no halt flag.
+
+    Every request publishes exactly one terminal :class:`CopyRequestResult`
+    (appended to :attr:`results`); repeated cancels and repeated result
+    reads never add completions.
+    """
+
+    def __init__(self, ring: DmaRing) -> None:
+        if not isinstance(ring, DmaRing):
+            raise TypeError(
+                f"ring: expected DmaRing, got {type(ring).__name__}")
+        self.ring = ring
+        self._output = bytearray()
+        self._requests: deque[CopyRequest] = deque()
+        self._occupied: dict[int, CopyRequest] = {}
+        self._next_request_id = 1
+        self.results: list[CopyRequestResult] = []
+
+    @property
+    def output(self) -> bytes:
+        """All bytes copied so far, in request/descriptor order."""
+        return bytes(self._output)
+
+    @property
+    def active(self) -> int:
+        """Number of in-flight (not yet finished) requests."""
+        return len(self._requests)
+
+    def submit(self, head) -> CopyRequest:
+        """Validate and freeze a chain, returning its request handle.
+
+        The whole chain is walked from ``head`` following committed ``next``
+        pointers: every slot must be released to the device and not already
+        occupied by another in-flight request.  On success each slot's
+        current generation is frozen into the request; later steps acquire
+        the slots with those exact generations, so slot reuse while the
+        request is in flight is impossible.  All validation happens before
+        any state changes, so a rejected submit leaves the engine
+        untouched.  Buffer-range checks remain device-side (per step), as
+        with :class:`CopyEngine`.
+        """
+        _, head = self.ring._slot(head)
+        chain: list[int] = []
+        seen: set[int] = set()
+        idx: int | None = head
+        prev: int | None = None
+        while idx is not None:
+            if not isinstance(idx, int) or isinstance(idx, bool) \
+                    or not 0 <= idx < self.ring.capacity:
+                raise ChainError(
+                    f"descriptor {prev}: next={idx!r} is not a valid ring "
+                    f"index", index=prev, reason="next-out-of-range")
+            if idx in seen:
+                raise ChainError(
+                    f"descriptor {prev}: next={idx} forms a cycle",
+                    index=prev, reason="cycle")
+            slot = self.ring._slots[idx]
+            if slot.owner is not Owner.DEVICE:
+                raise OwnershipError(
+                    f"descriptor {idx}: not released to device "
+                    f"(owner={slot.owner.value})")
+            holder = self._occupied.get(idx)
+            if holder is not None:
+                raise SlotBusyError(
+                    f"descriptor {idx}: already occupied by in-flight "
+                    f"request {holder.request_id}",
+                    index=idx, request_id=holder.request_id)
+            seen.add(idx)
+            chain.append(idx)
+            prev = idx
+            idx = slot.next
+        generations = tuple(self.ring._slots[i].generation for i in chain)
+        request = CopyRequest(self._next_request_id, head,
+                              tuple(chain), generations)
+        self._next_request_id += 1
+        for i in chain:
+            self._occupied[i] = request
+        self._requests.append(request)
+        return request
+
+    def step(self) -> bool:
+        """Process one event for the oldest in-flight request.
+
+        Exactly one of: confirm that request's pending cancel (ending it
+        and releasing its remaining descriptors), or copy/complete its next
+        descriptor.  Returns ``True`` if an event was processed, ``False``
+        if no request is in flight.
+        """
+        if not self._requests:
+            return False
+        request = self._requests[0]
+        if request._cancel_requested:
+            skipped = self._release_remaining(request, request._position)
+            self._finish(request, "cancelled", skipped=skipped)
+            return True
+        pos = request._position
+        idx = request._chain[pos]
+        generation = request._generations[pos]
+        try:
+            snap = self.ring.device_acquire(idx, expected_generation=generation)
+        except DmaRingError as exc:
+            # Defensive: submit() froze ownership and generations, so this
+            # cannot happen while the invariants hold.  If it ever does,
+            # end only this request and release what we still hold.
+            problem = f"descriptor {idx}: {exc}"
+            skipped = self._release_remaining(request, pos + 1)
+            request._descriptors.append(idx)
+            self._finish(request, "error", error=problem, error_index=idx,
+                         skipped=skipped)
+            return True
+        request._seen.add(idx)
+        problem = _validate_copy_descriptor(self.ring, idx, snap,
+                                            request._seen)
+        if problem is not None:
+            self.ring.device_release(idx, status="error", error=problem,
+                                     bytes_done=0)
+            request._descriptors.append(idx)
+            skipped = self._release_remaining(request, pos + 1)
+            self._finish(request, "error", error=problem, error_index=idx,
+                         skipped=skipped)
+            return True
+        data = bytes(self.ring.pool[snap.offset: snap.offset + snap.length])
+        self._output += data
+        request._copied += len(data)
+        self.ring.device_release(idx, status="ok", bytes_done=snap.length)
+        request._descriptors.append(idx)
+        request._position += 1
+        if request._position == len(request._chain):
+            self._finish(request, "ok")
+        return True
+
+    def drain(self) -> None:
+        """Step until no request is in flight."""
+        while self.step():
+            pass
+
+    # -- internals ----------------------------------------------------------
+
+    def _release_remaining(self, request: CopyRequest, from_pos: int
+                           ) -> tuple[int, ...]:
+        """Hand the request's unprocessed descriptors back to the CPU.
+
+        Uses the normal device release/acquire rules: each slot is acquired
+        at its frozen generation and released with completion status
+        ``skipped`` and ``bytes_done=0``, so the CPU observes a real
+        completion record when it re-acquires the slot.
+        """
+        skipped: list[int] = []
+        for pos in range(from_pos, len(request._chain)):
+            idx = request._chain[pos]
+            self.ring.device_acquire(
+                idx, expected_generation=request._generations[pos])
+            self.ring.device_release(idx, status="skipped", bytes_done=0)
+            skipped.append(idx)
+        return tuple(skipped)
+
+    def _finish(self, request: CopyRequest, status: str, *,
+                error: str | None = None, error_index: int | None = None,
+                skipped: tuple[int, ...] = ()) -> None:
+        """Publish the request's single terminal result and free its slots."""
+        result = CopyRequestResult(
+            request_id=request.request_id,
+            head=request.head,
+            status=status,
+            error=error,
+            error_index=error_index,
+            bytes_copied=request._copied,
+            descriptors=tuple(request._descriptors),
+            skipped=skipped,
+        )
+        request._result = result
+        request._done = True
+        self.results.append(result)
+        self._requests.popleft()
+        for idx in request._chain:
+            del self._occupied[idx]
