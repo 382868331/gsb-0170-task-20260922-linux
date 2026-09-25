@@ -26,6 +26,12 @@ engine halts without consuming subsequent queued chains.
 
 Only the contract documented here is implemented; this is not a complete
 model of any industry-standard DMA controller.
+
+Completion notifications may optionally be *coalesced*
+(:class:`CompletionCoalescer`).  Coalescing affects notifications only:
+completion records are still published and ownership is still returned to
+the CPU inside ``device_release``; nothing about data visibility is ever
+delayed.  Without a coalescer attached the ring behaves exactly as before.
 """
 
 from __future__ import annotations
@@ -210,6 +216,9 @@ class DmaRing:
             raise ValueError(f"pool_size: must be >= 0, got {pool_size}")
         self.pool = bytearray(pool_size)
         self._slots = [_Slot() for _ in range(self.capacity)]
+        # Optional CompletionCoalescer; attached by that class.  ``None``
+        # means per-completion notification behaviour is untouched.
+        self._coalescer: "CompletionCoalescer | None" = None
 
     # -- internal helpers --------------------------------------------------
 
@@ -368,6 +377,12 @@ class DmaRing:
         slot.completions += 1
         slot.device_held = False
         slot.owner = Owner.CPU
+        coalescer = self._coalescer
+        if coalescer is not None:
+            # Notification only; the completion above is already published
+            # and ownership is already back with the CPU, so this hook can
+            # never delay data visibility.
+            coalescer._on_completion(i, slot.generation)
 
     # -- chain validation / introspection -----------------------------------
 
@@ -432,6 +447,199 @@ class DmaRing:
             "completion": slot.completion,
             "completions": slot.completions,
         }
+
+
+# ---------------------------------------------------------------------------
+# Completion notification coalescer
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class CompletionEvent:
+    """One completion as observed by the notification coalescer.
+
+    The identity of a completion is the ``(index, generation)`` pair: when a
+    ring slot wraps and is reused, the new completion carries a new
+    generation and is a distinct event even though the index is the same.
+    """
+
+    index: int
+    generation: int
+
+
+@dataclass(frozen=True)
+class NotificationBatch:
+    """One delivered notification: all completions in one coalescing window.
+
+    ``completions`` are in actual completion order (the order in which
+    ``device_release`` committed them), including ``error`` completions.
+    """
+
+    completions: tuple[CompletionEvent, ...]
+    reason: str            # "count" | "timeout" | "flush"
+    time: int              # logical time at which the batch was produced
+
+
+class CompletionCoalescer:
+    """Coalesces completion notifications by count threshold or timeout.
+
+    Notifications are the *only* thing this object changes.  Completion
+    records are published and ownership is returned to the CPU inside
+    ``device_release`` exactly as without a coalescer; ``cpu_acquire`` /
+    ``cpu_read_completion`` never wait for a notification.  Completions are
+    queued here in the exact order they occur (errors included).
+
+    Time is logical, driven solely by :meth:`advance`; nothing reads a wall
+    clock.  A batch is produced when the queued count reaches
+    ``count_threshold`` or when logical time reaches the completion time of
+    the oldest queued item plus ``timeout`` (boundary inclusive: equality
+    fires).  If both conditions hold at the same logical time, exactly one
+    batch is produced (reason ``"count"``).  :meth:`flush` forces a batch
+    immediately regardless of the thresholds; flushing an empty queue
+    produces nothing.
+
+    Notifications are a consume-on-read queue: each produced batch is
+    returned by :meth:`notifications` / :meth:`pop_notification` once and
+    only once.
+
+    Parameters:
+        ring:            the ring whose ``device_release`` calls are observed.
+        count_threshold: positive completion count that triggers a batch.
+        timeout:         positive logical-time span after the oldest queued
+                         completion that triggers a batch.
+    """
+
+    def __init__(self, ring: DmaRing, *, count_threshold, timeout) -> None:
+        if not isinstance(ring, DmaRing):
+            raise TypeError(
+                f"ring: expected DmaRing, got {type(ring).__name__}")
+        count_threshold = _as_int(count_threshold, "count_threshold")
+        if count_threshold < 1:
+            raise ValueError(
+                f"count_threshold: must be >= 1, got {count_threshold}")
+        timeout = _as_int(timeout, "timeout")
+        if timeout < 1:
+            raise ValueError(f"timeout: must be >= 1, got {timeout}")
+        if ring._coalescer is not None:
+            raise ValueError("ring already has a CompletionCoalescer attached")
+        self.ring = ring
+        self.count_threshold = count_threshold
+        self.timeout = timeout
+        self._now = 0
+        # Pending, not-yet-notified completions in completion order.
+        self._pending: deque[CompletionEvent] = deque()
+        # Produced but not yet consumed by the caller.
+        self._ready: deque[NotificationBatch] = deque()
+        # Completion logical time of the oldest item in _pending.
+        self._deadline: int | None = None
+        ring._coalescer = self
+
+    # -- logical clock ------------------------------------------------------
+
+    def advance(self, delta=1) -> int:
+        """Advance logical time by a positive integer ``delta``.
+
+        A timeout whose boundary falls inside the jump fires at that exact
+        boundary time (equality fires), not at the jump's end.  Returns the
+        new logical time.
+        """
+        delta = _as_int(delta, "delta")
+        if delta < 1:
+            raise ValueError(f"delta: must be >= 1, got {delta}")
+        target = self._now + delta
+        # In this synchronous model completions only happen between advance
+        # calls, so at most one deadline becomes due per advance; the loop
+        # still jumps straight to the boundary rather than busy-waiting.
+        if self._pending and self._deadline is not None \
+                and self._deadline <= target:
+            self._now = self._deadline
+            self._pump()
+        self._now = target
+        return self._now
+
+    @property
+    def now(self) -> int:
+        """Current logical time."""
+        return self._now
+
+    # -- notification delivery ---------------------------------------------
+
+    def flush(self) -> NotificationBatch | None:
+        """Produce and deliver one batch from everything currently pending.
+
+        The batch is returned directly to the caller: it is *not* also left
+        in the unread queue, so it can never be consumed twice.  Returns
+        ``None`` when the pending queue is empty.
+        """
+        if not self._pending:
+            return None
+        return self._emit("flush", deliver=True)
+
+    def notifications(self) -> list[NotificationBatch]:
+        """Drain and return all produced-but-unread batches (oldest first).
+
+        Consuming: a second immediate call returns an empty list.
+        """
+        out = list(self._ready)
+        self._ready.clear()
+        return out
+
+    def pop_notification(self) -> NotificationBatch | None:
+        """Pop the oldest produced-but-unread batch, or ``None``."""
+        if not self._ready:
+            return None
+        return self._ready.popleft()
+
+    @property
+    def pending(self) -> int:
+        """Number of completions not yet included in a produced batch."""
+        return len(self._pending)
+
+    @property
+    def unread(self) -> int:
+        """Number of produced batches not yet consumed by the caller."""
+        return len(self._ready)
+
+    # -- internals ----------------------------------------------------------
+
+    def _on_completion(self, index: int, generation: int) -> None:
+        """Hook invoked by ``DmaRing.device_release`` after publication."""
+        self._pending.append(CompletionEvent(index, generation))
+        if self._deadline is None:
+            self._deadline = self._now + self.timeout
+        self._pump()
+
+    def _pump(self) -> None:
+        """Produce every batch currently due at ``self._now``.
+
+        Count and timeout are one combined condition, so a time at which
+        both hold yields exactly one batch (count wins the reason label).
+        """
+        while self._pending:
+            due_by_count = len(self._pending) >= self.count_threshold
+            due_by_timeout = (self._deadline is not None
+                              and self._now >= self._deadline)
+            if due_by_count:
+                self._emit("count")
+            elif due_by_timeout:
+                self._emit("timeout")
+            else:
+                break
+
+    def _emit(self, reason: str, *, deliver: bool = False
+              ) -> NotificationBatch:
+        batch = NotificationBatch(
+            completions=tuple(self._pending),
+            reason=reason,
+            time=self._now,
+        )
+        self._pending.clear()
+        self._deadline = None
+        if deliver:
+            # Direct delivery (flush): hand it to the caller now; it is not
+            # parked in the unread queue, so it cannot be read twice.
+            return batch
+        self._ready.append(batch)
+        return batch
 
 
 # ---------------------------------------------------------------------------
