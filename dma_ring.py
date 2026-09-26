@@ -125,6 +125,39 @@ class ChainResult:
     descriptors: tuple[int, ...]
 
 
+@dataclass(frozen=True)
+class BlitDescriptorSnapshot:
+    """Immutable view of a committed 2D blit descriptor.
+
+    Addresses are generated as ``start + row * stride`` for each logical
+    row ``0 <= r < rows``; each row spans ``row_bytes`` bytes.  Strides may
+    be negative.  ``rows == 0`` or ``row_bytes == 0`` is an empty
+    rectangle: a successful zero transfer generating no addresses.
+    """
+
+    index: int
+    generation: int
+    src: int
+    dst: int
+    rows: int
+    row_bytes: int
+    src_stride: int
+    dst_stride: int
+    next: int | None
+
+
+@dataclass(frozen=True)
+class BlitChainResult:
+    """Outcome of one chain processed by :class:`BlitEngine`."""
+
+    head: int
+    status: str            # "ok" (rejections happen at submit time)
+    error: str | None
+    error_index: int | None
+    bytes_blitted: int
+    descriptors: tuple[int, ...]
+
+
 # ---------------------------------------------------------------------------
 # Input validation helpers
 # ---------------------------------------------------------------------------
@@ -170,6 +203,10 @@ class _Slot:
         "owner", "cpu_held", "device_held", "generation",
         "offset", "length", "next",          # committed (visible) fields
         "p_offset", "p_length", "p_next",    # pending (staged by CPU)
+        "kind", "src", "dst", "rows", "row_bytes",
+        "src_stride", "dst_stride",          # committed blit fields
+        "p_kind", "p_src", "p_dst", "p_rows", "p_row_bytes",
+        "p_src_stride", "p_dst_stride",      # pending blit fields
         "completion",                        # committed completion triple
         "completions",                       # lifetime completion count
     )
@@ -185,6 +222,20 @@ class _Slot:
         self.p_offset = 0
         self.p_length = 0
         self.p_next = None
+        self.kind = "copy"
+        self.src = 0
+        self.dst = 0
+        self.rows = 0
+        self.row_bytes = 0
+        self.src_stride = 0
+        self.dst_stride = 0
+        self.p_kind = "copy"
+        self.p_src = 0
+        self.p_dst = 0
+        self.p_rows = 0
+        self.p_row_bytes = 0
+        self.p_src_stride = 0
+        self.p_dst_stride = 0
         self.completion: tuple[str, str | None, int] | None = None
         self.completions = 0
 
@@ -243,8 +294,55 @@ class DmaRing:
             raise ValueError(f"descriptor {i}: length {length} < 0")
         if next is not None:
             next = _as_int(next, "next")
+        slot.p_kind = "copy"
         slot.p_offset = offset
         slot.p_length = length
+        slot.p_next = next
+
+    def cpu_write_blit(self, index, *, src, dst, rows, row_bytes,
+                       src_stride, dst_stride, next=None) -> None:
+        """Stage a 2D blit descriptor.  Requires CPU ownership.
+
+        ``src``/``dst`` are the start addresses of the first source and
+        destination rows in the pool; row ``r`` starts at
+        ``start + r * stride`` and spans ``row_bytes`` bytes.  Strides may
+        be negative.  ``rows`` and ``row_bytes`` must be >= 0; a zero of
+        either is an empty rectangle (a successful zero transfer).
+
+        As with :meth:`cpu_write`, all arguments are validated before any
+        state changes, and generated-address bounds against the pool are
+        *not* checked here: every generated address is validated by
+        :class:`BlitEngine` when the request is submitted.
+        """
+        slot, i = self._slot(index)
+        if slot.owner is not Owner.CPU or not slot.cpu_held:
+            raise OwnershipError(
+                f"descriptor {i}: CPU cannot write "
+                f"(owner={slot.owner.value}, cpu_held={slot.cpu_held})")
+        src = _as_int(src, "src")
+        dst = _as_int(dst, "dst")
+        rows = _as_int(rows, "rows")
+        row_bytes = _as_int(row_bytes, "row_bytes")
+        src_stride = _as_int(src_stride, "src_stride")
+        dst_stride = _as_int(dst_stride, "dst_stride")
+        if rows < 0:
+            raise ValueError(f"descriptor {i}: rows {rows} < 0")
+        if row_bytes < 0:
+            raise ValueError(f"descriptor {i}: row_bytes {row_bytes} < 0")
+        if next is not None:
+            next = _as_int(next, "next")
+        slot.p_kind = "blit"
+        slot.p_src = src
+        slot.p_dst = dst
+        slot.p_rows = rows
+        slot.p_row_bytes = row_bytes
+        slot.p_src_stride = src_stride
+        slot.p_dst_stride = dst_stride
+        # Mirror into the generic offset/length fields so introspection and
+        # the device_release bytes_done bound stay meaningful: length is the
+        # total transferred bytes (row payload only, no stride padding).
+        slot.p_offset = src
+        slot.p_length = rows * row_bytes
         slot.p_next = next
 
     def cpu_release(self, index) -> int:
@@ -261,6 +359,13 @@ class DmaRing:
         slot.offset = slot.p_offset
         slot.length = slot.p_length
         slot.next = slot.p_next
+        slot.kind = slot.p_kind
+        slot.src = slot.p_src
+        slot.dst = slot.p_dst
+        slot.rows = slot.p_rows
+        slot.row_bytes = slot.p_row_bytes
+        slot.src_stride = slot.p_src_stride
+        slot.dst_stride = slot.p_dst_stride
         slot.generation += 1
         slot.completion = None
         slot.cpu_held = False
@@ -339,6 +444,16 @@ class DmaRing:
                 f"descriptor {i}: device must device_acquire before reading")
         return DescriptorSnapshot(
             i, slot.generation, slot.offset, slot.length, slot.next)
+
+    def device_read_blit(self, index) -> BlitDescriptorSnapshot:
+        """Read committed 2D blit fields.  Requires ``device_acquire``."""
+        slot, i = self._slot(index)
+        if not slot.device_held:
+            raise VisibilityError(
+                f"descriptor {i}: device must device_acquire before reading")
+        return BlitDescriptorSnapshot(
+            i, slot.generation, slot.src, slot.dst, slot.rows,
+            slot.row_bytes, slot.src_stride, slot.dst_stride, slot.next)
 
     def device_release(self, index, *, status, bytes_done=0, error=None
                        ) -> None:
@@ -429,6 +544,13 @@ class DmaRing:
             "offset": slot.offset,
             "length": slot.length,
             "next": slot.next,
+            "kind": slot.kind,
+            "src": slot.src,
+            "dst": slot.dst,
+            "rows": slot.rows,
+            "row_bytes": slot.row_bytes,
+            "src_stride": slot.src_stride,
+            "dst_stride": slot.dst_stride,
             "completion": slot.completion,
             "completions": slot.completions,
         }
@@ -550,3 +672,180 @@ class CopyEngine:
             head=head, status="error", error=problem, error_index=idx,
             bytes_copied=copied, descriptors=tuple(done)))
         self.halted = True
+
+
+# ---------------------------------------------------------------------------
+# Blit engine (synthesised 2D device)
+# ---------------------------------------------------------------------------
+
+def _blit_range_ok(pool_size: int, start: int, rows: int, row_bytes: int,
+                   stride: int) -> bool:
+    """Check every generated row address of one rectangle.
+
+    Row addresses form the arithmetic progression start + r * stride;
+    the extremes are the two endpoints, so checking both covers every
+    row.  An empty rectangle generates no addresses and is in range.
+    """
+    if rows == 0 or row_bytes == 0:
+        return True
+    first = start
+    last = start + (rows - 1) * stride
+    lo = min(first, last)
+    hi = max(first, last)
+    return 0 <= lo and hi + row_bytes <= pool_size
+
+
+class _BlitRequest:
+    """A validated, queued blit chain with its source-byte snapshot."""
+
+    __slots__ = ("head", "entries")
+
+    def __init__(self, head: int, entries: list) -> None:
+        self.head = head
+        # entries: (index, BlitDescriptorSnapshot, src_rows); src_rows[r]
+        # is the immutable source bytes of logical row r at submit time.
+        self.entries = entries
+
+
+class BlitEngine:
+    """Synchronous device model blitting 2D strided rectangles.
+
+    Shares the ring byte pool with CopyEngine and reuses the same
+    descriptor-ring ownership handoff; descriptors are staged with
+    DmaRing.cpu_write_blit and committed with cpu_release.
+
+    Request reception is submit_chain: it walks the whole chain,
+    acquires each descriptor, and validates *every* generated row
+    address (source and destination) against the pool.  If any row of
+    any descriptor is out of bounds, nothing is written and nothing is
+    queued: the offending descriptor is completed 'error', already-
+    acquired predecessors are completed 'skipped', and ChainError is
+    raised.  On success the engine snapshots exactly the source rows
+    the chain will read (not the whole pool), so the transfer is
+    interpreted against the source bytes as of the successful submit;
+    overlapping source/destination therefore has a deterministic
+    result.
+
+    run() then performs the queued transfers: logical rows are written
+    in ascending row order, columns ascending within a row, so when
+    destination rows overlap each other the later write wins.  Pool
+    bytes outside every destination row (stride padding included) keep
+    their previous values.  bytes_done counts payload bytes only
+    (rows * row_bytes), never stride padding.
+    """
+
+    def __init__(self, ring: DmaRing) -> None:
+        if not isinstance(ring, DmaRing):
+            raise TypeError(
+                f"ring: expected DmaRing, got {type(ring).__name__}")
+        self.ring = ring
+        self._queue: deque[_BlitRequest] = deque()
+        self.results: list[BlitChainResult] = []
+
+    @property
+    def queued(self) -> int:
+        """Number of submitted chains not yet processed."""
+        return len(self._queue)
+
+    def submit_chain(self, head) -> None:
+        """Validate and queue a blit chain, snapshotting source bytes.
+
+        Raises OwnershipError if the head (or a chained descriptor) was
+        never released to the device, and ChainError (carrying
+        index/reason) on a bad next pointer, a cycle, a non-blit
+        descriptor, or any generated row address outside the pool.  A
+        rejected submit writes nothing to the pool and queues nothing.
+        """
+        slot, head = self.ring._slot(head)
+        if slot.owner is not Owner.DEVICE:
+            raise OwnershipError(
+                f"chain head {head}: not released to device "
+                f"(owner={slot.owner.value})")
+        ring = self.ring
+        pool_size = len(ring.pool)
+        acquired: list[tuple[int, BlitDescriptorSnapshot]] = []
+        seen: set[int] = set()
+        idx: int | None = head
+        prev: int | None = None
+        problem: str | None = None
+        problem_index: int | None = None
+        reason: str | None = None
+        while idx is not None:
+            if not isinstance(idx, int) or isinstance(idx, bool) \
+                    or not 0 <= idx < ring.capacity:
+                problem = (f"descriptor {prev}: next={idx!r} is not a "
+                           f"valid ring index")
+                problem_index, reason = prev, "next-out-of-range"
+                break
+            if idx in seen:
+                problem = f"descriptor {prev}: next={idx} forms a cycle"
+                problem_index, reason = prev, "cycle"
+                break
+            try:
+                ring.device_acquire(idx)
+            except OwnershipError:
+                for done_idx, _ in acquired:
+                    ring.device_release(done_idx, status="skipped")
+                raise
+            snap = ring.device_read_blit(idx)
+            if ring.inspect(idx)["kind"] != "blit":
+                problem = f"descriptor {idx}: not a blit descriptor"
+                problem_index, reason = idx, "wrong-kind"
+                acquired.append((idx, snap))
+                break
+            if not _blit_range_ok(pool_size, snap.src, snap.rows,
+                                  snap.row_bytes, snap.src_stride) or \
+                    not _blit_range_ok(pool_size, snap.dst, snap.rows,
+                                       snap.row_bytes, snap.dst_stride):
+                problem = (f"descriptor {idx}: blit rectangle generates "
+                           f"addresses outside pool size {pool_size}")
+                problem_index, reason = idx, "buffer-out-of-range"
+                acquired.append((idx, snap))
+                break
+            seen.add(idx)
+            acquired.append((idx, snap))
+            prev = idx
+            idx = snap.next
+        if problem is not None:
+            for done_idx, _ in acquired:
+                if done_idx == problem_index and reason in (
+                        "wrong-kind", "buffer-out-of-range"):
+                    ring.device_release(done_idx, status="error",
+                                        error=problem, bytes_done=0)
+                else:
+                    ring.device_release(done_idx, status="skipped")
+            raise ChainError(problem, index=problem_index, reason=reason)
+        # Snapshot exactly the source rows, at submit time.
+        entries = []
+        for done_idx, snap in acquired:
+            src_rows = [
+                bytes(ring.pool[snap.src + r * snap.src_stride:
+                                snap.src + r * snap.src_stride
+                                + snap.row_bytes])
+                for r in range(snap.rows)
+            ]
+            entries.append((done_idx, snap, src_rows))
+        self._queue.append(_BlitRequest(head, entries))
+
+    def run(self) -> None:
+        """Process queued chains in submission order."""
+        while self._queue:
+            self._process_request(self._queue.popleft())
+
+    # -- internals ----------------------------------------------------------
+
+    def _process_request(self, request: _BlitRequest) -> None:
+        ring = self.ring
+        done: list[int] = []
+        blitted = 0
+        for idx, snap, src_rows in request.entries:
+            for r in range(snap.rows):
+                dst_addr = snap.dst + r * snap.dst_stride
+                ring.pool[dst_addr:dst_addr + snap.row_bytes] = src_rows[r]
+            payload = snap.rows * snap.row_bytes
+            blitted += payload
+            ring.device_release(idx, status="ok", bytes_done=payload)
+            done.append(idx)
+        self.results.append(BlitChainResult(
+            head=request.head, status="ok", error=None, error_index=None,
+            bytes_blitted=blitted, descriptors=tuple(done)))
