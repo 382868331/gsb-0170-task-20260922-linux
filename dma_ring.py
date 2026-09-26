@@ -39,6 +39,24 @@ MAX_CAPACITY = 64
 VALID_STATUSES = ("ok", "error", "skipped")
 
 
+def periodic_segment_bytes(sequence, size) -> bytes:
+    """Deterministic, monotonically increasing reference payload.
+
+    Segment ``sequence`` of ``size`` bytes contains the byte values
+    ``(sequence * size + j) & 0xFF`` for ``j`` in ``range(size)``.  This is
+    the fixed content contract of the periodic capture model; an independent
+    copy of the same formula is used by the tests as the oracle.
+    """
+    sequence = _as_int(sequence, "sequence")
+    size = _as_int(size, "size")
+    if sequence < 0:
+        raise ValueError(f"sequence: must be >= 0, got {sequence}")
+    if size < 0:
+        raise ValueError(f"size: must be >= 0, got {size}")
+    base = sequence * size
+    return bytes((base + j) & 0xFF for j in range(size))
+
+
 # ---------------------------------------------------------------------------
 # Errors
 # ---------------------------------------------------------------------------
@@ -550,3 +568,327 @@ class CopyEngine:
             head=head, status="error", error=problem, error_index=idx,
             bytes_copied=copied, descriptors=tuple(done)))
         self.halted = True
+
+
+# ---------------------------------------------------------------------------
+# Periodic capture ring
+# ---------------------------------------------------------------------------
+
+class OverrunError(DmaRingError):
+    """Software lagged so far that the lost sequence range became ambiguous.
+
+    Raised only when a finite counter_bits is configured and the hardware
+    has advanced a full counter modulus past the unclaimed cursor, so the
+    exact lost interval can no longer be derived from the counter.
+    """
+
+
+@dataclass(frozen=True)
+class SegmentInfo:
+    """One completed periodic segment handed to the software consumer.
+
+    sequence is the infinite (never reused) segment number; lap is the
+    1-based completion lap; generation counts how many times this slot has
+    been completed; data is an immutable copy of the slot buffer taken at
+    claim time.
+    """
+
+    sequence: int
+    lap: int
+    slot: int
+    generation: int
+    data: bytes
+
+
+@dataclass(frozen=True)
+class OverrunReport:
+    """Explicit record of segments overwritten before the software claimed
+    them.
+
+    lost_start..lost_end is the inclusive range of infinite sequences that
+    were overwritten; every sequence in the range is gone and can never be
+    claimed.
+    """
+
+    lost_start: int
+    lost_end: int
+
+    @property
+    def lost_count(self) -> int:
+        return self.lost_end - self.lost_start + 1
+
+
+@dataclass(frozen=True)
+class PartialSegment:
+    """State of the segment the hardware was writing when capture stopped."""
+
+    sequence: int
+    slot: int
+    bytes_written: int
+    segment_size: int
+
+
+@dataclass(frozen=True)
+class ClaimResult:
+    """Outcome of one claim: the segments delivered and the losses reported."""
+
+    segments: tuple[SegmentInfo, ...]
+    lost: tuple[OverrunReport, ...]
+
+    @property
+    def lost_count(self) -> int:
+        return sum(report.lost_count for report in self.lost)
+
+
+class PeriodicRing:
+    """Periodic capture: hardware loops over fixed buffer segments.
+
+    The hardware writes segment sequence into slot sequence % capacity;
+    each slot owns a fixed segment_size byte buffer. Completed segments
+    carry a completion generation (per-slot completion count) and are
+    claimed by the software in sequence order via claim(). If the software
+    falls more than one lap behind, the hardware overwrites the oldest
+    unclaimed segment; the overwrite is recorded explicitly and reported
+    as an OverrunReport naming the exact lost sequence range. Overwritten
+    data is never returned.
+
+    Ordering rule: the model is synchronous and single-threaded, so a
+    claim and a hardware completion never happen in the same instant.
+    When a claim and a completion are adjacent, the hardware step runs
+    first and the claim observes the new completion
+    (see hw_step_and_claim()).
+
+    Parameters:
+        capacity:     number of segments (slots); a power of two in
+                      [1, MAX_CAPACITY].
+        segment_size: bytes per segment, >= 1.
+        counter_bits: optional hardware sequence-counter width. With
+                      None (default) the model uses an infinite counter
+                      and every loss is reported exactly. With a finite
+                      width the visible counter wraps modulo
+                      2 ** counter_bits; if the software lags by a full
+                      modulus the loss range becomes ambiguous and
+                      OverrunError is raised instead of guessing.
+    """
+
+    def __init__(self, capacity, segment_size, *, counter_bits=None) -> None:
+        self.capacity = _check_capacity(capacity)
+        segment_size = _as_int(segment_size, "segment_size")
+        if segment_size < 1:
+            raise ValueError(
+                f"segment_size: must be >= 1, got {segment_size}")
+        self.segment_size = segment_size
+        if counter_bits is None:
+            self.counter_bits = None
+            self._modulus = None
+        else:
+            counter_bits = _as_int(counter_bits, "counter_bits")
+            if not 1 <= counter_bits <= 63:
+                raise ValueError(
+                    f"counter_bits: must be in [1, 63], got {counter_bits}")
+            self.counter_bits = counter_bits
+            self._modulus = 1 << counter_bits
+        # Fixed per-slot buffers; the hardware always writes in place.
+        self.buffers = [bytearray(segment_size) for _ in range(self.capacity)]
+        self._running = False
+        self._next_sequence = 0          # sequence of the segment in progress
+        self._bytes_in_current = 0       # bytes written into that segment
+        self._claimed_cursor = 0         # next sequence software may claim
+        self._completed = {}            # sequence -> (lap, generation)
+        self._generations = [0] * self.capacity
+        self._pending_lost = []
+        self.total_completed = 0
+        self.total_lost = 0
+
+    # -- lifecycle ---------------------------------------------------------
+
+    @property
+    def running(self) -> bool:
+        return self._running
+
+    def start(self) -> None:
+        """(Re)start capture. Retains all previously completed segments.
+
+        The software claim cursor is untouched: segments completed before
+        a stop remain claimable after the restart, and infinite sequence
+        numbering continues where it left off. A segment half written at
+        stop time is discarded; its sequence is rewritten from byte 0.
+        """
+        if self._running:
+            raise OwnershipError("periodic ring is already running")
+        self._bytes_in_current = 0
+        self._running = True
+
+    def stop(self) -> PartialSegment | None:
+        """Stop capture. Completed segments stay claimable.
+
+        Returns the half-written segment state (sequence, slot, byte
+        count) if the hardware was mid-segment, else None. The partial
+        bytes are never delivered as a completed segment.
+        """
+        if not self._running:
+            raise OwnershipError("periodic ring is not running")
+        self._running = False
+        if self._bytes_in_current == 0:
+            return None
+        partial = PartialSegment(
+            sequence=self._next_sequence,
+            slot=self._next_sequence % self.capacity,
+            bytes_written=self._bytes_in_current,
+            segment_size=self.segment_size,
+        )
+        self._bytes_in_current = 0
+        return partial
+
+    # -- hardware side -----------------------------------------------------
+
+    def _check_overrun_ambiguity(self) -> None:
+        if self._modulus is not None \
+                and self._next_sequence - self._claimed_cursor >= self._modulus:
+            raise OverrunError(
+                f"software lag {self._next_sequence - self._claimed_cursor} "
+                f"reached the {self.counter_bits}-bit counter modulus "
+                f"{self._modulus}: the lost sequence range is ambiguous; "
+                "claim more often or widen the counter")
+
+    def _note_overwrite(self, sequence: int) -> None:
+        self._completed.pop(sequence, None)
+        self.total_lost += 1
+        if self._pending_lost \
+                and self._pending_lost[-1].lost_end == sequence - 1:
+            last = self._pending_lost[-1]
+            self._pending_lost[-1] = OverrunReport(last.lost_start, sequence)
+        else:
+            self._pending_lost.append(OverrunReport(sequence, sequence))
+
+    def _write_bytes(self, data: bytes) -> None:
+        for byte in data:
+            if self._bytes_in_current == 0:
+                self._check_overrun_ambiguity()
+                # Starting a segment reuses the slot of the segment one
+                # lap earlier; if that older segment is still unclaimed
+                # its data is overwritten now and is lost forever.
+                victim = self._next_sequence - self.capacity
+                if victim in self._completed:
+                    self._note_overwrite(victim)
+            slot = self._next_sequence % self.capacity
+            self.buffers[slot][self._bytes_in_current] = byte
+            self._bytes_in_current += 1
+            if self._bytes_in_current == self.segment_size:
+                self._finish_segment()
+
+    def _finish_segment(self) -> None:
+        sequence = self._next_sequence
+        slot = sequence % self.capacity
+        self._generations[slot] += 1
+        lap = sequence // self.capacity + 1
+        self._completed[sequence] = (lap, self._generations[slot])
+        self.total_completed += 1
+        self._next_sequence = sequence + 1
+        self._bytes_in_current = 0
+
+    def hw_write_bytes(self, data) -> None:
+        """Hardware writes data (bytes-like) into the current segment."""
+        if not self._running:
+            raise OwnershipError("periodic ring is not running")
+        self._write_bytes(bytes(data))
+
+    def hw_advance(self, segments=1) -> None:
+        """Hardware completes segments whole segments in one call."""
+        if not self._running:
+            raise OwnershipError("periodic ring is not running")
+        segments = _as_int(segments, "segments")
+        if segments < 0:
+            raise ValueError(f"segments: must be >= 0, got {segments}")
+        for _ in range(segments):
+            if self._bytes_in_current != 0:
+                raise OwnershipError(
+                    "hw_advance requires segment-aligned state; "
+                    "finish or stop the partial segment first")
+            self._write_bytes(periodic_segment_bytes(
+                self._next_sequence, self.segment_size))
+
+    def hw_step(self) -> None:
+        """Hardware completes exactly one segment (aligned fast path)."""
+        self.hw_advance(1)
+
+    # -- software side -----------------------------------------------------
+
+    def _deliver(self, sequence: int) -> SegmentInfo:
+        lap, generation = self._completed.pop(sequence)
+        slot = sequence % self.capacity
+        return SegmentInfo(
+            sequence=sequence, lap=lap, slot=slot, generation=generation,
+            data=bytes(self.buffers[slot]))
+
+    def claim(self, max_segments=None) -> ClaimResult:
+        """Claim the next run of consecutive completed segments.
+
+        Returns up to max_segments (default: all available) segments in
+        sequence order, starting at the software claim cursor. Segments
+        the hardware is still writing are never delivered. Sequences that
+        were overwritten before this claim are reported in lost and
+        skipped; their (stale, overwritten) bytes are never returned. Each
+        reported loss is consumed by exactly one claim.
+        """
+        if max_segments is None:
+            limit = None
+        else:
+            limit = _as_int(max_segments, "max_segments")
+            if limit < 0:
+                raise ValueError(
+                    f"max_segments: must be >= 0, got {limit}")
+        lost = tuple(
+            report for report in self._pending_lost
+            if report.lost_end >= self._claimed_cursor)
+        self._pending_lost = [
+            report for report in self._pending_lost
+            if report.lost_end < self._claimed_cursor]
+        out = []
+        while limit is None or len(out) < limit:
+            sequence = self._claimed_cursor
+            if any(report.lost_start <= sequence <= report.lost_end
+                   for report in lost):
+                self._claimed_cursor = sequence + 1
+                continue
+            if sequence not in self._completed:
+                break
+            out.append(self._deliver(sequence))
+            self._claimed_cursor = sequence + 1
+        return ClaimResult(segments=tuple(out), lost=lost)
+
+    def hw_step_and_claim(self, max_segments=None) -> ClaimResult:
+        """One hardware completion immediately followed by one claim.
+
+        Defines the ordering when a completion and a claim are adjacent:
+        the hardware completes first, then the claim runs and therefore
+        observes (and may deliver) the just-completed segment.
+        """
+        self.hw_step()
+        return self.claim(max_segments)
+
+    # -- introspection -----------------------------------------------------
+
+    def hw_counter(self) -> int:
+        """The write position visible on the hardware sequence counter.
+
+        With finite counter_bits this is next_sequence modulo the counter
+        modulus (it wraps); otherwise it is the infinite value.
+        """
+        if self._modulus is None:
+            return self._next_sequence
+        return self._next_sequence % self._modulus
+
+    @property
+    def next_sequence(self) -> int:
+        """Infinite sequence number of the segment being written."""
+        return self._next_sequence
+
+    @property
+    def claim_cursor(self) -> int:
+        """Next sequence number the software may claim."""
+        return self._claimed_cursor
+
+    def pending_completed(self) -> list[int]:
+        """Sequences completed by hardware but not yet claimed, sorted."""
+        return sorted(self._completed)
