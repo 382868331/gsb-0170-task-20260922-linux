@@ -24,6 +24,15 @@ validates a whole chain up front; ``CopyEngine`` validates incrementally
 while copying.  A bad descriptor completes its chain with an error and the
 engine halts without consuming subsequent queued chains.
 
+Cancellation: ``CopyEngine.request_cancel`` revokes a chain that has not
+started or asks to stop the running one.  Descriptors already handed to the
+device are not reclaimed immediately; the device confirms at a work
+boundary by releasing the unexecuted remainder with status ``"skipped"``,
+and the chain completes as ``"cancelled"`` aggregating the completed
+prefix and the skipped rest.  Final states emit token/generation-tagged
+notifications so stale or duplicated notifications can never affect a new
+chain that recycled the same slots, and ``reclaim`` is idempotent.
+
 Only the contract documented here is implemented; this is not a complete
 model of any industry-standard DMA controller.
 """
@@ -114,15 +123,39 @@ class ChainResult:
 
     ``descriptors`` lists the slots that were completed (ok or error) in
     processing order; slots after a bad descriptor are *not* consumed and do
-    not appear here.
+    not appear here.  For a cancelled chain, ``descriptors`` holds the
+    prefix that completed before the stop took effect and ``skipped``
+    holds the not-yet-executed descriptors the device confirmed it will no
+    longer access, so the final state accounts for both the completed and
+    the never-executed parts of the chain.
     """
 
     head: int
-    status: str            # "ok" or "error"
+    status: str            # "ok", "error" or "cancelled"
     error: str | None
     error_index: int | None
     bytes_copied: int
     descriptors: tuple[int, ...]
+    skipped: tuple[int, ...] = ()
+    token: int = 0
+
+
+@dataclass(frozen=True)
+class ChainNotification:
+    """Device->CPU notification that a chain reached a final state.
+
+    Notifications are tagged with the chain ``token`` (unique per
+    submission, never reused) and the ``generation`` the head slot had
+    at submit time, so a stale or duplicated notification — e.g. one
+    belonging to a chain whose slots have since been reclaimed and reused
+    for a new chain — can never be mistaken for a notification about the
+    new chain.
+    """
+
+    token: int
+    head: int
+    generation: int
+    status: str            # "ok", "error" or "cancelled"
 
 
 # ---------------------------------------------------------------------------
@@ -442,15 +475,38 @@ class CopyEngine:
     """A synchronous device model that copies chain bytes into an output.
 
     Chains are submitted by head index and processed in submission order by
-    :meth:`run`.  Each descriptor is acquired, validated (buffer range and
-    ``next`` pointer), copied from the ring pool into the engine output, and
-    released back to the CPU with status ``ok``.  On the first bad
-    descriptor the engine releases *that* descriptor with status ``error``,
-    completes the chain as an error, and halts: the rest of the broken
-    chain and all subsequently queued chains are left unconsumed until
-    :meth:`reset_halt` is called.  Descriptors completed before the bad one
-    keep their ``ok`` completions and copied bytes (documented partial
-    completion semantics).
+    :meth:`run` (or one descriptor at a time via :meth:`step`).  Each
+    descriptor is acquired, validated (buffer range and ``next`` pointer),
+    copied from the ring pool into the engine output, and released back to
+    the CPU with status ``ok``.  On the first bad descriptor the engine
+    releases *that* descriptor with status ``error``, completes the chain
+    as an error, and halts: the rest of the broken chain and all
+    subsequently queued chains are left unconsumed until :meth:`reset_halt`
+    is called.  Descriptors completed before the bad one keep their ``ok``
+    completions and copied bytes (documented partial completion semantics).
+
+    Cancellation / stop:
+
+    * :meth:`submit_chain` returns a unique chain token.
+    * :meth:`request_cancel` asks to revoke a chain that has not started
+      yet, or to stop the chain currently executing.  The request only
+      takes effect at a device work boundary (the next :meth:`step`):
+      descriptors already handed to the device are *not* reclaimed
+      immediately — the device first confirms it no longer accesses them
+      by releasing each remaining descriptor with status ``"skipped"``.
+    * The chain then reaches its final state ``"cancelled"``, whose
+      :class:`ChainResult` aggregates the completed prefix
+      (``descriptors``, ``bytes_copied``) and the never-executed rest
+      (``skipped``).
+    * Every final state (ok / error / cancelled) emits exactly one
+      :class:`ChainNotification` into :attr:`notifications`, tagged with
+      the chain token and the head-slot generation at submit time.  Tokens
+      are never reused, so a stale or duplicated notification can never be
+      attributed to a later chain that recycled the same ring slots.
+    * :meth:`reclaim` is the CPU-side consumption of that notification:
+      it raises :class:`OwnershipError` while the device has not confirmed
+      the final state, and is idempotent afterwards — repeated calls and
+      duplicated notifications release nothing twice.
     """
 
     def __init__(self, ring: DmaRing) -> None:
@@ -459,8 +515,12 @@ class CopyEngine:
                 f"ring: expected DmaRing, got {type(ring).__name__}")
         self.ring = ring
         self._output = bytearray()
-        self._queue: deque[int] = deque()
+        self._queue: deque[int] = deque()      # tokens, submission order
+        self._chains: dict[int, _ChainState] = {}
+        self._current: _ChainState | None = None
+        self._next_token = 1
         self.results: list[ChainResult] = []
+        self.notifications: deque[ChainNotification] = deque()
         self.halted = False
 
     @property
@@ -473,26 +533,191 @@ class CopyEngine:
         """Number of submitted chains not yet processed."""
         return len(self._queue)
 
-    def submit_chain(self, head) -> None:
-        """Queue a chain by head index.  The head must be device-owned."""
+    def submit_chain(self, head) -> int:
+        """Queue a chain by head index.  The head must be device-owned.
+
+        Returns the chain token: a unique, never-reused handle used by
+        :meth:`request_cancel` and :meth:`reclaim`.
+        """
         slot, head = self.ring._slot(head)
         if slot.owner is not Owner.DEVICE:
             raise OwnershipError(
                 f"chain head {head}: not released to device "
                 f"(owner={slot.owner.value})")
-        self._queue.append(head)
+        token = self._next_token
+        self._next_token += 1
+        self._chains[token] = _ChainState(
+            token=token, head=head, head_generation=slot.generation)
+        self._queue.append(token)
+        return token
+
+    def request_cancel(self, token) -> None:
+        """Ask the device to revoke or stop a chain.
+
+        For a queued chain this revokes it before it starts; for the chain
+        currently executing it is a stop request that takes effect at the
+        next descriptor boundary.  The request is only recorded here — the
+        device confirms it (releasing the not-yet-executed descriptors with
+        status ``"skipped"``) during :meth:`step`/:meth:`run`.
+        Requesting twice while pending is a harmless no-op; requesting for
+        an unknown token or an already-final chain raises
+        :class:`DmaRingError`.
+        """
+        state = self._chain_state(token)
+        if state.result is not None:
+            raise DmaRingError(
+                f"chain token {state.token}: already in final state "
+                f"{state.result.status!r}; cannot cancel")
+        state.cancel_requested = True
+
+    def reclaim(self, token) -> ChainResult:
+        """Consume the final-state notification for a chain (CPU side).
+
+        Raises :class:`OwnershipError` if the device has not confirmed the
+        chain's final state yet — descriptors already handed to the device
+        cannot be reclaimed until then.  Once final, the call discards any
+        queued notifications for this token (including stale duplicates)
+        and returns the recorded :class:`ChainResult`.  The operation is
+        idempotent: repeating it releases no resource twice.
+        """
+        state = self._chain_state(token)
+        if state.result is None:
+            raise OwnershipError(
+                f"chain token {state.token}: device has not confirmed the "
+                f"final state; its descriptors are still device-owned")
+        if self.notifications:
+            kept = [n for n in self.notifications
+                    if not self._notification_matches(state, n)]
+            self.notifications.clear()
+            self.notifications.extend(kept)
+        return state.result
 
     def run(self) -> None:
         """Process queued chains in order until the queue drains or a chain
-        error halts the engine."""
-        while self._queue and not self.halted:
-            self._process_chain(self._queue.popleft())
+        error halts the engine.  Pending cancel requests are confirmed at
+        the same work boundaries."""
+        while self.step():
+            pass
+
+    def step(self) -> bool:
+        """Advance the device by one work unit; return True if it did work.
+
+        One work unit is either the confirmation of a requested
+        cancellation, or the processing of a single descriptor of the
+        current chain.  Interleaving :meth:`step` with
+        :meth:`request_cancel` models a stop request landing while a
+        chain is executing.  Cancellation confirmations are honoured even
+        while the engine is halted — the device can always confirm it will
+        not touch a descriptor — but ordinary chain processing still waits
+        for :meth:`reset_halt`.
+        """
+        current = self._current
+        if current is not None:
+            if current.cancel_requested:
+                self._confirm_cancel(current)
+                self._current = None
+                return True
+            if self.halted:
+                return False
+            self._step_descriptor(current)
+            return True
+        if not self._queue:
+            return False
+        state = self._chains[self._queue[0]]
+        if state.cancel_requested:
+            self._queue.popleft()
+            self._confirm_cancel(state)
+            return True
+        if self.halted:
+            return False
+        self._queue.popleft()
+        self._current = state
+        return True
 
     def reset_halt(self) -> None:
         """Clear the halt flag so queued chains can be processed again."""
         self.halted = False
 
     # -- internals ----------------------------------------------------------
+
+    def _chain_state(self, token) -> "_ChainState":
+        token = _as_int(token, "token")
+        state = self._chains.get(token)
+        if state is None:
+            raise DmaRingError(f"unknown chain token {token}")
+        return state
+
+    @staticmethod
+    def _notification_matches(state: "_ChainState",
+                              note: ChainNotification) -> bool:
+        """A notification belongs to `state` only if both the token and the
+        submit-time head generation match; anything else is stale (e.g. the
+        slot was reclaimed and reused by a newer chain) and must not affect
+        the new chain."""
+        return (note.token == state.token
+                and note.generation == state.head_generation)
+
+    def _finalize(self, state: "_ChainState", result: ChainResult) -> None:
+        state.result = result
+        self.results.append(result)
+        self.notifications.append(ChainNotification(
+            token=state.token, head=state.head,
+            generation=state.head_generation, status=result.status))
+
+    def _confirm_cancel(self, state: "_ChainState") -> None:
+        """Device confirms a cancel/stop: every not-yet-executed descriptor
+        is released back to the CPU with status ``"skipped"``, and the
+        chain completes as ``"cancelled"`` aggregating the completed
+        prefix and the skipped rest."""
+        ring = self.ring
+        idx = state.idx
+        while idx is not None and 0 <= idx < ring.capacity \
+                and idx not in state.seen:
+            state.seen.add(idx)
+            try:
+                snap = ring.device_acquire(idx)
+            except OwnershipError:
+                # Never handed to the device (missing cpu_release); the CPU
+                # still owns it, so there is nothing to confirm for it.
+                break
+            ring.device_release(idx, status="skipped", bytes_done=0)
+            state.skipped.append(idx)
+            idx = snap.next
+        self._finalize(state, ChainResult(
+            head=state.head, status="cancelled", error=None,
+            error_index=None, bytes_copied=state.copied,
+            descriptors=tuple(state.done), skipped=tuple(state.skipped),
+            token=state.token))
+
+    def _step_descriptor(self, state: "_ChainState") -> None:
+        ring = self.ring
+        idx = state.idx
+        try:
+            snap = ring.device_acquire(idx)
+        except OwnershipError as exc:
+            # e.g. a descriptor in the chain was never cpu_release'd
+            self._fail_chain(state, idx, f"descriptor {idx}: {exc}")
+            return
+        state.seen.add(idx)
+        problem = self._validate_descriptor(idx, snap, state.seen)
+        if problem is not None:
+            ring.device_release(idx, status="error", error=problem,
+                                bytes_done=0)
+            state.done.append(idx)
+            self._fail_chain(state, idx, problem)
+            return
+        data = bytes(ring.pool[snap.offset: snap.offset + snap.length])
+        self._output += data
+        state.copied += len(data)
+        ring.device_release(idx, status="ok", bytes_done=snap.length)
+        state.done.append(idx)
+        state.idx = snap.next
+        if state.idx is None:
+            self._finalize(state, ChainResult(
+                head=state.head, status="ok", error=None, error_index=None,
+                bytes_copied=state.copied, descriptors=tuple(state.done),
+                token=state.token))
+            self._current = None
 
     def _validate_descriptor(self, idx: int, snap: DescriptorSnapshot,
                              seen: set[int]) -> str | None:
@@ -512,41 +737,33 @@ class CopyEngine:
                 return f"descriptor {idx}: next={nxt} forms a cycle"
         return None
 
-    def _process_chain(self, head: int) -> None:
-        ring = self.ring
-        seen: set[int] = set()
-        idx: int | None = head
-        done: list[int] = []
-        copied = 0
-        while idx is not None:
-            try:
-                snap = ring.device_acquire(idx)
-            except OwnershipError as exc:
-                # e.g. a descriptor in the chain was never cpu_release'd
-                self._fail_chain(head, done, copied, idx,
-                                 f"descriptor {idx}: {exc}")
-                return
-            seen.add(idx)
-            problem = self._validate_descriptor(idx, snap, seen)
-            if problem is not None:
-                ring.device_release(idx, status="error", error=problem,
-                                    bytes_done=0)
-                done.append(idx)
-                self._fail_chain(head, done, copied, idx, problem)
-                return
-            data = bytes(ring.pool[snap.offset: snap.offset + snap.length])
-            self._output += data
-            copied += len(data)
-            ring.device_release(idx, status="ok", bytes_done=snap.length)
-            done.append(idx)
-            idx = snap.next
-        self.results.append(ChainResult(
-            head=head, status="ok", error=None, error_index=None,
-            bytes_copied=copied, descriptors=tuple(done)))
-
-    def _fail_chain(self, head: int, done: list[int], copied: int,
-                    idx: int, problem: str) -> None:
-        self.results.append(ChainResult(
-            head=head, status="error", error=problem, error_index=idx,
-            bytes_copied=copied, descriptors=tuple(done)))
+    def _fail_chain(self, state: "_ChainState", idx: int,
+                    problem: str) -> None:
+        self._finalize(state, ChainResult(
+            head=state.head, status="error", error=problem, error_index=idx,
+            bytes_copied=state.copied, descriptors=tuple(state.done),
+            token=state.token))
         self.halted = True
+        self._current = None
+
+
+class _ChainState:
+    """Per-submission bookkeeping for one chain (internal)."""
+
+    __slots__ = (
+        "token", "head", "head_generation", "idx", "seen",
+        "done", "skipped", "copied", "cancel_requested", "result",
+    )
+
+    def __init__(self, *, token: int, head: int, head_generation: int
+                 ) -> None:
+        self.token = token
+        self.head = head
+        self.head_generation = head_generation
+        self.idx: int | None = head
+        self.seen: set[int] = set()
+        self.done: list[int] = []
+        self.skipped: list[int] = []
+        self.copied = 0
+        self.cancel_requested = False
+        self.result: ChainResult | None = None

@@ -56,6 +56,34 @@ def main() -> None:
     print(f"legal handoff afterwards: status={comp.status} "
           f"bytes_done={comp.bytes_done}")
 
+    # --- 3. Stop a running chain and reclaim only after confirmation -----
+    # Chain 2 -> 3: the CPU requests a stop after the first descriptor has
+    # been processed; the device confirms at the next work boundary.
+    ring.cpu_write(2, offset=0, length=8, next=3)
+    ring.cpu_release(2)
+    ring.cpu_write(3, offset=16, length=8, next=None)
+    ring.cpu_release(3)
+    token = engine.submit_chain(2)
+    engine.step()                        # start chain
+    engine.step()                        # descriptor 2 copied
+    engine.request_cancel(token)         # stop request mid-chain
+    print("\n=== stop request / cancel ===")
+    try:
+        engine.reclaim(token)
+        print("ERROR: reclaim unexpectedly succeeded before confirmation")
+    except Exception as exc:
+        print(f"reclaim before device confirmation rejected: "
+              f"{type(exc).__name__}: {exc}")
+    engine.run()                         # device confirms the stop
+    result = engine.results[-1]
+    print(f"chain token={token} status={result.status} "
+          f"done={result.descriptors} skipped={result.skipped} "
+          f"bytes_copied={result.bytes_copied}")
+    result2 = engine.reclaim(token)      # idempotent, no double release
+    print(f"reclaim after confirmation: status={result2.status}; "
+          f"desc 3 completion={ring.cpu_acquire(3).status} "
+          f"completions={ring.completion_count(3)}")
+
 
 if __name__ == "__main__":
     main()

@@ -7,8 +7,10 @@ import unittest
 
 from dma_ring import (
     ChainError,
+    ChainNotification,
     CopyEngine,
     DmaRing,
+    DmaRingError,
     GenerationError,
     OwnershipError,
     VisibilityError,
@@ -332,6 +334,154 @@ class TestChainsAndCopying(unittest.TestCase):
         self.assertTrue(ring.inspect(0)["device_held"])
         ring.device_release(0, status="ok", bytes_done=4)
         self.assertEqual(ring.cpu_acquire(0).status, "ok")
+
+
+class TestCancelAndStop(unittest.TestCase):
+    def test_cancel_queued_chain_before_start(self):
+        ring = make_ring()
+        write_and_release(ring, 0, offset=0, length=4, next=1)
+        write_and_release(ring, 1, offset=4, length=4, next=None)
+        write_and_release(ring, 2, offset=8, length=4, next=None)
+        engine = CopyEngine(ring)
+        engine.submit_chain(2)
+        token = engine.submit_chain(0)
+        engine.request_cancel(token)
+        # Not confirmed yet: the descriptors are still device-owned and
+        # cannot be reclaimed.
+        with self.assertRaises(OwnershipError):
+            engine.reclaim(token)
+        engine.run()
+        ok, cancelled = engine.results
+        self.assertEqual(ok.status, "ok")
+        self.assertEqual(cancelled.status, "cancelled")
+        self.assertEqual(cancelled.descriptors, ())
+        self.assertEqual(cancelled.skipped, (0, 1))
+        self.assertEqual(cancelled.bytes_copied, 0)
+        self.assertEqual(engine.output, SOURCE[8:12])
+        # Device confirmed it no longer accesses the descriptors: both were
+        # released back with status "skipped" exactly once.
+        for idx in (0, 1):
+            comp = ring.cpu_acquire(idx)
+            self.assertEqual(comp.status, "skipped")
+            self.assertEqual(comp.bytes_done, 0)
+            self.assertEqual(ring.completion_count(idx), 1)
+        result = engine.reclaim(token)
+        self.assertIs(result, cancelled)
+
+    def test_stop_request_during_execution(self):
+        ring = make_ring()
+        write_and_release(ring, 0, offset=0, length=4, next=1)
+        write_and_release(ring, 1, offset=4, length=4, next=2)
+        write_and_release(ring, 2, offset=8, length=4, next=None)
+        engine = CopyEngine(ring)
+        token = engine.submit_chain(0)
+        self.assertTrue(engine.step())   # start chain
+        self.assertTrue(engine.step())   # descriptor 0 copied
+        engine.request_cancel(token)     # stop request mid-chain
+        engine.request_cancel(token)     # duplicate request is a no-op
+        engine.run()                     # confirm happens at the boundary
+        (result,) = engine.results
+        self.assertEqual(result.status, "cancelled")
+        self.assertEqual(result.descriptors, (0,))   # completed prefix
+        self.assertEqual(result.skipped, (1, 2))     # never executed
+        self.assertEqual(result.bytes_copied, 4)
+        self.assertEqual(engine.output, SOURCE[0:4])
+        self.assertEqual(ring.cpu_acquire(0).status, "ok")
+        self.assertEqual(ring.cpu_acquire(1).status, "skipped")
+        self.assertEqual(ring.cpu_acquire(2).status, "skipped")
+
+    def test_cancel_unknown_or_final_token_rejected(self):
+        ring = make_ring()
+        write_and_release(ring, 0, offset=0, length=4, next=None)
+        engine = CopyEngine(ring)
+        token = engine.submit_chain(0)
+        with self.assertRaises(DmaRingError):
+            engine.request_cancel(token + 99)
+        with self.assertRaises(DmaRingError):
+            engine.reclaim(token + 99)
+        with self.assertRaises(TypeError):
+            engine.request_cancel(True)
+        engine.run()
+        with self.assertRaises(DmaRingError):
+            engine.request_cancel(token)  # already final
+
+    def test_stale_and_duplicate_notifications_do_not_affect_new_chain(self):
+        ring = make_ring()
+        write_and_release(ring, 0, offset=0, length=4, next=None)
+        engine = CopyEngine(ring)
+        old_token = engine.submit_chain(0)
+        engine.request_cancel(old_token)
+        engine.run()
+        (old_note,) = list(engine.notifications)
+        self.assertEqual(old_note.status, "cancelled")
+        old_result = engine.reclaim(old_token)
+        self.assertEqual(old_result.status, "cancelled")
+        # CPU reclaims slot 0 and reuses it for a brand-new chain.
+        self.assertEqual(ring.cpu_acquire(0).status, "skipped")
+        write_and_release(ring, 0, offset=16, length=4, next=None)
+        self.assertEqual(ring.inspect(0)["generation"], 2)
+        new_token = engine.submit_chain(0)
+        self.assertNotEqual(new_token, old_token)
+        # A duplicated stale notification from the old chain (e.g. a bus
+        # retry) plus a stale-generation forgery must not disturb anything.
+        engine.notifications.append(old_note)
+        engine.notifications.append(ChainNotification(
+            token=old_token, head=0, generation=1, status="cancelled"))
+        engine.run()
+        self.assertEqual(len(engine.results), 2)
+        new_result = engine.results[1]
+        self.assertEqual(new_result.status, "ok")
+        self.assertEqual(engine.output, SOURCE[16:20])
+        # Reclaiming again is idempotent: the duplicate notifications are
+        # discarded and nothing is released twice.
+        self.assertIs(engine.reclaim(old_token), old_result)
+        self.assertEqual(ring.completion_count(0), 2)  # skipped + ok
+        self.assertEqual(ring.cpu_acquire(0).status, "ok")
+        self.assertEqual(ring.completion_count(0), 2)
+        self.assertIs(engine.reclaim(new_token), new_result)
+
+    def test_partial_completion_stop_and_slot_reuse_interleaved(self):
+        ring = make_ring()
+        write_and_release(ring, 0, offset=0, length=4, next=1)
+        write_and_release(ring, 1, offset=4, length=4, next=None)
+        engine = CopyEngine(ring)
+        token = engine.submit_chain(0)
+        engine.step()                    # start
+        engine.step()                    # descriptor 0 done (partial)
+        engine.request_cancel(token)
+        engine.step()                    # stop confirmed at boundary
+        (result,) = engine.results
+        self.assertEqual(
+            (result.status, result.descriptors, result.skipped),
+            ("cancelled", (0,), (1,)))
+        engine.reclaim(token)
+        ring.cpu_acquire(0)
+        ring.cpu_acquire(1)
+        # Reuse slot 1 immediately for a new chain while the old chain's
+        # notification could still be floating around.
+        write_and_release(ring, 1, offset=32, length=4, next=None)
+        new_token = engine.submit_chain(1)
+        engine.run()
+        self.assertEqual(engine.results[1].status, "ok")
+        self.assertEqual(engine.output, SOURCE[0:4] + SOURCE[32:36])
+        self.assertEqual(ring.completion_count(1), 2)  # skipped + ok
+
+    def test_cancel_confirmation_processed_while_halted(self):
+        ring = make_ring()
+        write_and_release(ring, 0, offset=200, length=64, next=None)  # bad
+        write_and_release(ring, 1, offset=0, length=4, next=None)
+        engine = CopyEngine(ring)
+        engine.submit_chain(0)
+        token = engine.submit_chain(1)
+        engine.request_cancel(token)
+        engine.run()                     # chain 0 errors and halts
+        self.assertTrue(engine.halted)
+        # The queued chain was cancelled, so the device still confirmed it
+        # even though ordinary processing is halted.
+        cancelled = engine.results[1]
+        self.assertEqual(cancelled.status, "cancelled")
+        self.assertEqual(cancelled.skipped, (1,))
+        self.assertEqual(ring.cpu_acquire(1).status, "skipped")
 
 
 if __name__ == "__main__":
