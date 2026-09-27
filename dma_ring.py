@@ -22,7 +22,10 @@ Chains: descriptors carry a ``next`` index (or ``None``) allowing
 scatter/gather chains that may wrap around the ring.  ``DmaRing.walk_chain``
 validates a whole chain up front; ``CopyEngine`` validates incrementally
 while copying.  A bad descriptor completes its chain with an error and the
-engine halts without consuming subsequent queued chains.
+engine halts without consuming subsequent queued chains.  Queued chains
+that never started can be cancelled; a running chain can be asked to
+stop, and the not-yet-executed descriptors are reclaimed only after the
+device confirms it no longer accesses them (see :class:`CopyEngine`).
 
 Only the contract documented here is implemented; this is not a complete
 model of any industry-standard DMA controller.
@@ -75,6 +78,16 @@ class ChainError(DmaRingError):
         self.reason = reason
 
 
+class ChainStateError(DmaRingError):
+    """A chain-control operation was attempted in the wrong state.
+
+    Raised when cancelling a chain that is not queued (already started or
+    unknown), or when requesting a stop for a chain that is not currently
+    executing.  Stale or duplicate *notifications* (stop confirmations)
+    are not errors: they are rejected by a False return instead.
+    """
+
+
 # ---------------------------------------------------------------------------
 # Public data structures
 # ---------------------------------------------------------------------------
@@ -112,17 +125,22 @@ class CompletionSnapshot:
 class ChainResult:
     """Outcome of one chain processed by :class:`CopyEngine`.
 
+    ``status`` is one of "ok", "error", "cancelled" or "stopped".
     ``descriptors`` lists the slots that were completed (ok or error) in
-    processing order; slots after a bad descriptor are *not* consumed and do
-    not appear here.
+    processing order; ``skipped`` lists the slots that were handed back
+    to the CPU without being executed (cancel/stop).  The final state of a
+    chain therefore aggregates both the completed and the never-executed
+    parts.  Slots after a bad descriptor are *not* consumed and do not
+    appear in ``descriptors``.
     """
 
     head: int
-    status: str            # "ok" or "error"
+    status: str            # "ok", "error", "cancelled" or "stopped"
     error: str | None
     error_index: int | None
     bytes_copied: int
     descriptors: tuple[int, ...]
+    skipped: tuple[int, ...] = ()
 
 
 # ---------------------------------------------------------------------------
@@ -438,19 +456,52 @@ class DmaRing:
 # Copy engine (synthesised device)
 # ---------------------------------------------------------------------------
 
+class _ChainRecord:
+    """Internal per-submission chain state tracked by :class:`CopyEngine`."""
+
+    __slots__ = ("token", "head", "idx", "seen", "done", "copied")
+
+    def __init__(self, *, token: int, head: int) -> None:
+        self.token = token
+        self.head = head
+        self.idx: int | None = head   # next descriptor to process
+        self.seen: set[int] = set()
+        self.done: list[int] = []
+        self.copied = 0
+
 class CopyEngine:
     """A synchronous device model that copies chain bytes into an output.
 
-    Chains are submitted by head index and processed in submission order by
-    :meth:`run`.  Each descriptor is acquired, validated (buffer range and
-    ``next`` pointer), copied from the ring pool into the engine output, and
-    released back to the CPU with status ``ok``.  On the first bad
-    descriptor the engine releases *that* descriptor with status ``error``,
-    completes the chain as an error, and halts: the rest of the broken
-    chain and all subsequently queued chains are left unconsumed until
-    :meth:`reset_halt` is called.  Descriptors completed before the bad one
-    keep their ``ok`` completions and copied bytes (documented partial
-    completion semantics).
+    Chains are submitted by head index and processed in submission order.
+    :meth:`run` processes everything to completion; :meth:`step` processes
+    exactly one descriptor, which lets a caller observe (and stop) a chain
+    while it is executing.  Each descriptor is acquired, validated (buffer
+    range and ``next`` pointer), copied from the ring pool into the engine
+    output, and released back to the CPU with status ``ok``.  On the first
+    bad descriptor the engine releases *that* descriptor with status
+    ``error``, completes the chain as an error, and halts: the rest of the
+    broken chain and all subsequently queued chains are left unconsumed
+    until :meth:`reset_halt` is called.  Descriptors completed before the
+    bad one keep their ``ok`` completions and copied bytes (documented
+    partial completion semantics).
+
+    Chain control:
+
+    * :meth:`cancel_chain` revokes a chain that is still queued and was
+      never started.  The device never touched its descriptors, so they
+      are handed back to the CPU immediately with status ``skipped``.
+    * :meth:`request_stop` asks to stop the chain that is currently
+      executing.  The parts already handed to the device cannot be
+      reclaimed right away: the not-yet-executed descriptors stay
+      device-owned until the device confirms it no longer accesses them
+      via :meth:`confirm_stop`.  Only then are they released back to
+      the CPU with status ``skipped`` and the chain finalised with
+      status ``stopped``.
+    * Every submitted chain carries a unique token (returned by
+      :meth:`submit_chain` and :meth:`request_stop`).  A stop
+      confirmation must name the token; stale confirmations (slot/head
+      already reused by a newer chain) and duplicate confirmations are
+      rejected with a ``False`` return and release nothing twice.
     """
 
     def __init__(self, ring: DmaRing) -> None:
@@ -459,7 +510,10 @@ class CopyEngine:
                 f"ring: expected DmaRing, got {type(ring).__name__}")
         self.ring = ring
         self._output = bytearray()
-        self._queue: deque[int] = deque()
+        self._queue: deque[_ChainRecord] = deque()
+        self._active: _ChainRecord | None = None
+        self._stopping: list[_ChainRecord] = []
+        self._next_token = 0
         self.results: list[ChainResult] = []
         self.halted = False
 
@@ -473,24 +527,137 @@ class CopyEngine:
         """Number of submitted chains not yet processed."""
         return len(self._queue)
 
-    def submit_chain(self, head) -> None:
-        """Queue a chain by head index.  The head must be device-owned."""
+    @property
+    def active_head(self) -> int | None:
+        """Head index of the chain currently executing, or ``None``."""
+        return self._active.head if self._active is not None else None
+
+    @property
+    def stopping_heads(self) -> tuple[int, ...]:
+        """Heads of chains awaiting a stop confirmation."""
+        return tuple(record.head for record in self._stopping)
+
+    def submit_chain(self, head) -> int:
+        """Queue a chain by head index.  The head must be device-owned.
+
+        Returns the chain token, which uniquely identifies this submission
+        and is required to confirm a later stop request.
+        """
         slot, head = self.ring._slot(head)
         if slot.owner is not Owner.DEVICE:
             raise OwnershipError(
                 f"chain head {head}: not released to device "
                 f"(owner={slot.owner.value})")
-        self._queue.append(head)
+        self._next_token += 1
+        token = self._next_token
+        self._queue.append(_ChainRecord(token=token, head=head))
+        return token
 
     def run(self) -> None:
         """Process queued chains in order until the queue drains or a chain
-        error halts the engine."""
-        while self._queue and not self.halted:
-            self._process_chain(self._queue.popleft())
+        error halts the engine.
+
+        Chains with a pending stop request are not finished here; they wait
+        for :meth:`confirm_stop` and do not block later queued chains.
+        """
+        while self.step():
+            pass
+
+    def step(self) -> bool:
+        """Process exactly one descriptor of the active/next queued chain.
+
+        Returns ``True`` if a descriptor was processed (or a chain
+        finalised), ``False`` when halted or when no queued chain remains.
+        """
+        if self.halted:
+            return False
+        if self._active is None:
+            if not self._queue:
+                return False
+            self._active = self._queue.popleft()
+        self._process_one(self._active)
+        return True
 
     def reset_halt(self) -> None:
         """Clear the halt flag so queued chains can be processed again."""
         self.halted = False
+
+    # -- chain control ------------------------------------------------------
+
+    def cancel_chain(self, head) -> ChainResult:
+        """Revoke a queued chain that was never started.
+
+        Every descriptor of the chain is handed back to the CPU with
+        status ``skipped`` (the device never acquired any of them, so
+        immediate reclaim is safe) and a ``cancelled`` :class:`ChainResult`
+        is recorded and returned.
+
+        Raises :class:`ChainStateError` if no queued chain with this head
+        exists (already started, already cancelled, or never submitted).
+        """
+        _, head = self.ring._slot(head)
+        for record in self._queue:
+            if record.head == head:
+                self._queue.remove(record)
+                skipped = self._reclaim(record.idx, record.seen)
+                result = ChainResult(
+                    head=head, status="cancelled", error=None,
+                    error_index=None, bytes_copied=0, descriptors=(),
+                    skipped=tuple(skipped))
+                self.results.append(result)
+                return result
+        raise ChainStateError(
+            f"chain head {head}: cannot cancel; not queued "
+            f"(already started, already cancelled, or never submitted)")
+
+    def request_stop(self, head) -> int:
+        """Ask to stop the chain that is currently executing.
+
+        The already-completed prefix keeps its ``ok`` completions.  The
+        not-yet-executed descriptors stay device-owned — they were handed
+        to the device and cannot be reclaimed until the device confirms it
+        no longer accesses them via :meth:`confirm_stop`.  Returns the
+        chain token needed for that confirmation.
+
+        Raises :class:`ChainStateError` if this head is not the currently
+        executing chain (use :meth:`cancel_chain` for queued chains).
+        """
+        _, head = self.ring._slot(head)
+        record = self._active
+        if record is None or record.head != head:
+            raise ChainStateError(
+                f"chain head {head}: cannot stop; not currently executing")
+        self._active = None
+        self._stopping.append(record)
+        return record.token
+
+    def confirm_stop(self, head, token) -> bool:
+        """Device confirmation that it no longer accesses a stopped chain.
+
+        On acceptance the not-yet-executed descriptors are released back
+        to the CPU with status ``skipped``, a ``stopped``
+        :class:`ChainResult`` aggregating the completed and skipped parts
+        is recorded, and ``True`` is returned.
+
+        Stale confirmations (the token belongs to an old chain whose
+        head/slots were reused by a newer chain) and duplicate
+        confirmations return ``False`` and change nothing: resources are
+        never released twice and new chains are never affected by old
+        notifications.
+        """
+        _, head = self.ring._slot(head)
+        token = _as_int(token, "token")
+        for record in self._stopping:
+            if record.head == head and record.token == token:
+                self._stopping.remove(record)
+                skipped = self._reclaim(record.idx, record.seen)
+                self.results.append(ChainResult(
+                    head=record.head, status="stopped", error=None,
+                    error_index=None, bytes_copied=record.copied,
+                    descriptors=tuple(record.done),
+                    skipped=tuple(skipped)))
+                return True
+        return False
 
     # -- internals ----------------------------------------------------------
 
@@ -512,41 +679,77 @@ class CopyEngine:
                 return f"descriptor {idx}: next={nxt} forms a cycle"
         return None
 
-    def _process_chain(self, head: int) -> None:
+    def _process_one(self, record: _ChainRecord) -> None:
+        """Process the next descriptor of the active chain record."""
         ring = self.ring
-        seen: set[int] = set()
-        idx: int | None = head
-        done: list[int] = []
-        copied = 0
-        while idx is not None:
-            try:
-                snap = ring.device_acquire(idx)
-            except OwnershipError as exc:
-                # e.g. a descriptor in the chain was never cpu_release'd
-                self._fail_chain(head, done, copied, idx,
-                                 f"descriptor {idx}: {exc}")
-                return
-            seen.add(idx)
-            problem = self._validate_descriptor(idx, snap, seen)
-            if problem is not None:
-                ring.device_release(idx, status="error", error=problem,
-                                    bytes_done=0)
-                done.append(idx)
-                self._fail_chain(head, done, copied, idx, problem)
-                return
-            data = bytes(ring.pool[snap.offset: snap.offset + snap.length])
-            self._output += data
-            copied += len(data)
-            ring.device_release(idx, status="ok", bytes_done=snap.length)
-            done.append(idx)
-            idx = snap.next
-        self.results.append(ChainResult(
-            head=head, status="ok", error=None, error_index=None,
-            bytes_copied=copied, descriptors=tuple(done)))
+        idx = record.idx
+        try:
+            snap = ring.device_acquire(idx)
+        except OwnershipError as exc:
+            # e.g. a descriptor in the chain was never cpu_release'd
+            self._fail_chain(record, idx, f"descriptor {idx}: {exc}")
+            return
+        record.seen.add(idx)
+        problem = self._validate_descriptor(idx, snap, record.seen)
+        if problem is not None:
+            ring.device_release(idx, status="error", error=problem,
+                                bytes_done=0)
+            record.done.append(idx)
+            self._fail_chain(record, idx, problem)
+            return
+        data = bytes(ring.pool[snap.offset: snap.offset + snap.length])
+        self._output += data
+        record.copied += len(data)
+        ring.device_release(idx, status="ok", bytes_done=snap.length)
+        record.done.append(idx)
+        record.idx = snap.next
+        if record.idx is None:
+            self.results.append(ChainResult(
+                head=record.head, status="ok", error=None, error_index=None,
+                bytes_copied=record.copied, descriptors=tuple(record.done)))
+            self._active = None
 
-    def _fail_chain(self, head: int, done: list[int], copied: int,
-                    idx: int, problem: str) -> None:
+    def _fail_chain(self, record: _ChainRecord, idx: int,
+                    problem: str) -> None:
         self.results.append(ChainResult(
-            head=head, status="error", error=problem, error_index=idx,
-            bytes_copied=copied, descriptors=tuple(done)))
+            head=record.head, status="error", error=problem, error_index=idx,
+            bytes_copied=record.copied, descriptors=tuple(record.done)))
         self.halted = True
+        self._active = None
+
+    def _walk_from(self, start: int | None, seen: set[int]) -> list[int]:
+        """Defensively walk committed ``next`` pointers from ``start``.
+
+        Used only for cancel/stop reclaim, not for chain validation: the
+        walk stops silently at an out-of-range index or a cycle instead of
+        raising, so a malformed chain can still be torn down.
+        """
+        order: list[int] = []
+        visited = set(seen)
+        idx = start
+        while idx is not None:
+            if not isinstance(idx, int) or isinstance(idx, bool) \
+                    or not 0 <= idx < self.ring.capacity:
+                break
+            if idx in visited:
+                break
+            visited.add(idx)
+            order.append(idx)
+            idx = self.ring._slots[idx].next
+        return order
+
+    def _reclaim(self, start: int | None, seen: set[int]) -> list[int]:
+        """Hand not-yet-executed chain descriptors back to the CPU.
+
+        Every device-owned descriptor reachable from ``start`` is
+        acquired and released with status ``skipped`` (the device
+        confirms it no longer accesses them).  Returns the walked indices
+        in chain order, whether or not they needed reclaiming.
+        """
+        order = self._walk_from(start, seen)
+        for idx in order:
+            slot = self.ring._slots[idx]
+            if slot.owner is Owner.DEVICE and not slot.device_held:
+                self.ring.device_acquire(idx)
+                self.ring.device_release(idx, status="skipped", bytes_done=0)
+        return order

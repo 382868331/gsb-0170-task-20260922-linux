@@ -23,7 +23,9 @@ python demo.py                            # 一次正确复制 + 一次可见性
 - `DescriptorSnapshot(index, generation, offset, length, next)` — 已提交描述符字段的不可变视图
 - `CompletionSnapshot(index, generation, status, error, bytes_done)` — 已提交完成记录；
   `status ∈ {"ok", "error", "skipped"}`
-- `ChainResult(head, status, error, error_index, bytes_copied, descriptors)` — 单链处理结果
+- `ChainResult(head, status, error, error_index, bytes_copied, descriptors, skipped)` — 单链处理结果；
+  status ∈ {"ok", "error", "cancelled", "stopped"}，descriptors 为已完成槽位，
+  skipped 为未执行即被归还的槽位
 - `Owner.{CPU, DEVICE}`
 
 ### `DmaRing(capacity, pool_size)`
@@ -39,9 +41,29 @@ python demo.py                            # 一次正确复制 + 一次可见性
 
 ### `CopyEngine(ring)`（合成设备，同步复制参考）
 
-- `submit_chain(head)`、`run()`、`reset_halt()`
+- `submit_chain(head) -> int`（返回链令牌 token）、`run()`、`step() -> bool`
+  （只处理一个描述符，可观察执行中的链）、`reset_halt()`
+- 链控制：`cancel_chain(head) -> ChainResult`（撤销尚未开始的排队链）、
+  `request_stop(head) -> int`（对正在执行的链提出停止请求，返回 token）、
+  `confirm_stop(head, token) -> bool`（设备确认不再访问后回收）
 - 输出：`engine.output`（复制字节结果）、`engine.results`（`ChainResult` 列表）、
-  `engine.queued`、`engine.halted`
+  `engine.queued`、`engine.halted`、`engine.active_head`、`engine.stopping_heads`
+
+### 撤销与停止语义
+
+- **撤销排队链**：`cancel_chain(head)` 只接受从未开始的排队链；设备从未 acquire
+  其任何描述符，因此全部描述符立即以 `skipped` 归还 CPU（completion 计数 +1），
+  链最终状态为 `cancelled`。链已开始或不存在时抛 `ChainStateError`，不静默。
+- **停止执行中的链**：`request_stop(head)` 后，已完成前缀保留 `ok` 与已复制字节；
+  尚未执行的描述符仍归设备所有——它们已交给设备，CPU 在设备确认前 `cpu_acquire`
+  会被拒绝。`confirm_stop(head, token)` 表示设备确认不再访问，此时未执行描述符才以
+  `skipped` 归还，链以 `stopped` 完成，`ChainResult` 的 descriptors 与
+  skipped 汇总已完成和尚未执行的两部分。
+- **令牌防旧通知、重复通知幂等**：每次 `submit_chain` 返回唯一 token；
+  `confirm_stop` 必须同时匹配 head 与 token。槽位/head 被新链复用后的迟到旧通知、
+  token 或 head 不匹配的通知返回 `False` 且不改变任何状态；同一停止只能确认一次，
+  重复确认返回 `False`，不会二次释放资源（completion 计数、输出字节均不重复）。
+- 等待停止确认的链不阻塞后续排队链；错误 halt 语义不变，仍需 `reset_halt()`。
 
 ## 所有权与可见性协议
 
@@ -64,6 +86,7 @@ python demo.py                            # 一次正确复制 + 一次可见性
 | `VisibilityError` | 未 acquire 就读描述符或完成字段 |
 | `GenerationError` | expected_generation 与已提交 generation 不符（ABA） |
 | `ChainError` | 整链验证失败；携带 `.index` 与 `.reason`（`cycle` / `buffer-out-of-range` / `next-out-of-range`） |
+| `ChainStateError` | 对未排队链撤销、或对非执行中链请求停止 |
 
 `cpu_write`/`device_release` 先完成全部校验再改状态，失败调用不留部分变更。
 
@@ -97,3 +120,5 @@ NaN/Infinity（`ValueError`），整数参数拒绝 bool（`TypeError`），非�
 - 只实现本文档所述契约子集，不宣称兼容任何行业标准 DMA 控制器。
 - `inspect()` 绕过所有权规则，仅供测试/调试，不属于协议接口。
 - 引擎 halt 后已排队链保留在队列中，需显式 `reset_halt()` 才会继续。
+- 停止请求后未执行部分只能由 `confirm_stop` 回收；若调用方永不确认，这些描述符
+  将一直停留在设备侧（这是明确建模的资源生命周期，非死锁检测）。
